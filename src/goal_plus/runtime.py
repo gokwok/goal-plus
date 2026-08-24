@@ -6816,6 +6816,147 @@ class FileSearchRuntime:
             self.report(run_id)
         return patch_path
 
+    def _publication_root_match(
+        self,
+        client: AgentPosixSdkClient,
+        snapshot: FsSnapshotArtifactRef,
+    ) -> bool:
+        result = client.invoke(
+            "fs.verify",
+            {
+                "snapshotId": snapshot.snapshot_id,
+                "dependencies": [{"path": ".", "scope": "tree_content"}],
+            },
+            timeout_seconds=60.0,
+        )
+        return result.get("status") == "matched"
+
+    def _invoke_publication_replace(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        run_id: str,
+        request_id: str,
+        base: FsSnapshotArtifactRef,
+        target: FsSnapshotArtifactRef,
+    ) -> dict[str, Any] | None:
+        params = {
+            "baseSnapshotId": base.snapshot_id,
+            "targetSnapshotId": target.snapshot_id,
+            "requestId": request_id,
+        }
+        deadline = time.monotonic() + 120.0
+        try:
+            result = client.invoke(
+                "fs.replace",
+                params,
+                timeout_seconds=120.0,
+            )
+        except AgentPosixBridgeError as exc:
+            if exc.completion_unknown or exc.code == "RequestInProgress":
+                return self._recover_fs_request_result(
+                    client=client,
+                    run_id=run_id,
+                    request_id=request_id,
+                    operation="fs.replace",
+                    deadline=deadline,
+                )
+            try:
+                recovered = self._recover_fs_request_result(
+                    client=client,
+                    run_id=run_id,
+                    request_id=request_id,
+                    operation="fs.replace",
+                    deadline=deadline,
+                )
+            except AgentPosixBridgeError:
+                raise exc
+            if recovered is None:
+                self._update_fs_request(
+                    run_id,
+                    request_id,
+                    state="failed",
+                    error={
+                        "message": str(exc),
+                        "code": exc.code,
+                        "delivery": exc.delivery,
+                    },
+                )
+                raise
+            return recovered
+        self._update_fs_request(
+            run_id,
+            request_id,
+            state="succeeded",
+            result=result,
+        )
+        return result
+
+    def _rotate_failed_publication_request(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        failed_request_id: str,
+        base: FsSnapshotArtifactRef,
+        target: FsSnapshotArtifactRef,
+        client: AgentPosixSdkClient,
+    ) -> str:
+        """Persist a new publication attempt after a confirmed terminal failure."""
+
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            if run.publication is None or run.publication.request_id != failed_request_id:
+                raise RuntimeError("publication request changed during reconciliation")
+            failed = next(
+                (
+                    item
+                    for item in run.fs_requests
+                    if item.request_id == failed_request_id
+                ),
+                None,
+            )
+            if failed is None or failed.state != "failed":
+                raise RuntimeError(
+                    "publication request rotation requires a terminal failed request"
+                )
+            request_id = new_request_id()
+            now = utc_timestamp()
+            run.fs_cleanup.append(
+                {
+                    "kind": "publication_attempt",
+                    "state": "terminal_failed",
+                    "request_id": failed_request_id,
+                    "error": failed.error,
+                    "recorded_at": now,
+                }
+            )
+            run.publication.request_id = request_id
+            run.publication.state = "prepared"
+            run.publication.manifest = None
+            run.publication.updated_at = now
+            run.fs_requests.append(
+                FsRequestRecord(
+                    request_id=request_id,
+                    operation="replace",
+                    context={
+                        "candidate_id": candidate_id,
+                        "base_snapshot_id": base.snapshot_id,
+                        "target_snapshot_id": target.snapshot_id,
+                        "prior_failed_request_id": failed_request_id,
+                    },
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            self._write_run(run)
+        # The failed outcome and successor identity are durable before the
+        # platform record is forgotten.
+        self._close_fs_requests_after_evidence(
+            run_id, [failed_request_id], client
+        )
+        return request_id
+
     def _strategy_mode(self, strategy: StrategySpec) -> str:
         return strategy.name.strip().lower().replace("-", "_")
 
