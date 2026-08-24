@@ -196,3 +196,161 @@ def fs_path_text(value: Any) -> str:
     return utf8
 
 
+class FsSnapshotArtifactReader:
+    def __init__(self, client: AgentPosixSdkClient) -> None:
+        self.client = client
+
+    def _changes_by_path(
+        self,
+        base: ArtifactRef,
+        target: ArtifactRef,
+    ) -> dict[str, dict[str, Any]]:
+        changes = self.client.snapshot_diff_all(
+            _snapshot_ref(base),
+            _snapshot_ref(target),
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for raw in changes:
+            path = fs_path_text(raw.get("path"))
+            if path in result:
+                raise AgentPosixBridgeError(
+                    f"fs.snapshot.diff returned duplicate path {path!r}"
+                )
+            result[path] = raw
+        return result
+
+    def changed_files(self, base: ArtifactRef, target: ArtifactRef) -> list[str]:
+        base_id = _snapshot_ref(base)
+        target_id = _snapshot_ref(target)
+        changed: list[str] = []
+        for path, change in self._changes_by_path(base, target).items():
+            if not candidate_artifact_path(path):
+                continue
+            snapshot_id = base_id if change.get("kind") == "deleted" else target_id
+            entry = self.client.invoke(
+                "fs.snapshot.stat",
+                {"snapshotId": snapshot_id, "path": path},
+            )
+            if entry.get("kind") != "directory":
+                changed.append(path)
+        return sorted(changed)
+
+    def _pread_prefix(
+        self,
+        snapshot_id: str,
+        path: str,
+        *,
+        length: int,
+    ) -> bytes:
+        output = bytearray()
+        while len(output) < length:
+            result = self.client.invoke(
+                "fs.snapshot.pread",
+                {
+                    "snapshotId": snapshot_id,
+                    "path": path,
+                    "offset": len(output),
+                    "length": min(64 * 1024, length - len(output)),
+                },
+            )
+            encoded = result.get("dataBase64")
+            if not isinstance(encoded, str):
+                raise AgentPosixBridgeError(
+                    "fs.snapshot.pread omitted dataBase64"
+                )
+            try:
+                chunk = base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise AgentPosixBridgeError(
+                    "fs.snapshot.pread returned invalid base64"
+                ) from exc
+            if not chunk:
+                break
+            output.extend(chunk)
+        return bytes(output)
+
+    def _file_sha256(
+        self,
+        snapshot_id: str,
+        path: str,
+        *,
+        expected_length: int,
+    ) -> str:
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected_length:
+            result = self.client.invoke(
+                "fs.snapshot.pread",
+                {
+                    "snapshotId": snapshot_id,
+                    "path": path,
+                    "offset": offset,
+                    "length": min(64 * 1024, expected_length - offset),
+                },
+            )
+            encoded = result.get("dataBase64")
+            if not isinstance(encoded, str):
+                raise AgentPosixBridgeError(
+                    "fs.snapshot.pread omitted dataBase64"
+                )
+            try:
+                chunk = base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise AgentPosixBridgeError(
+                    "fs.snapshot.pread returned invalid base64"
+                ) from exc
+            if not chunk:
+                raise AgentPosixBridgeError(
+                    "fs.snapshot.pread returned no bytes before expected EOF"
+                )
+            digest.update(chunk)
+            offset += len(chunk)
+        return digest.hexdigest()
+
+    def _project_entry(
+        self,
+        snapshot_id: str,
+        path: str,
+        *,
+        absent: bool,
+        max_bytes: int,
+    ) -> bytes:
+        if absent:
+            return b""
+        entry = self.client.invoke(
+            "fs.snapshot.stat",
+            {"snapshotId": snapshot_id, "path": path},
+        )
+        kind = entry.get("kind")
+        if kind == "file":
+            length = entry.get("len")
+            if not isinstance(length, int) or length < 0:
+                raise AgentPosixBridgeError("fs.snapshot.stat omitted file len")
+            if length <= max_bytes:
+                return self.client.snapshot_read_file(
+                    snapshot_id,
+                    path,
+                    max_bytes=max_bytes,
+                )
+            prefix = self._pread_prefix(
+                snapshot_id,
+                path,
+                length=max_bytes,
+            )
+            return prefix + b"\n[content truncated]\n"
+        if kind == "symlink":
+            target = fs_path_text(entry.get("symlinkTarget"))
+            return (target + "\n").encode("utf-8")
+        metadata = json.dumps(
+            {
+                "kind": kind,
+                "mode": entry.get("mode"),
+                "len": entry.get("len"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return (metadata + "\n").encode("utf-8")
+
+    def _entry_descriptor(
