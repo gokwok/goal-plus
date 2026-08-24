@@ -2182,3 +2182,175 @@ def _wait_any_owned(
         if time.monotonic() >= deadline:
             return {"event": None, "snapshot": snapshot_pool(root_dir=root_dir, pool_id=pool_id)}
         time.sleep(0.1)
+
+
+def wait_any(
+    *,
+    root_dir: Path | str,
+    pool_id: str,
+    timeout_seconds: float = 30.0,
+    client: AgentPosixSdkClient | None = None,
+) -> dict[str, Any]:
+    """Poll one pool through its single durable controller execution domain."""
+
+    if timeout_seconds < 0:
+        raise ValueError("pi-thinkthread wait timeout_seconds must be non-negative")
+    with _TryControllerLock(
+        _controller_lock_path(root_dir, pool_id)
+    ) as acquired:
+        if not acquired:
+            return {
+                "event": None,
+                "snapshot": snapshot_pool(root_dir=root_dir, pool_id=pool_id),
+                "controller_busy": True,
+            }
+        return _wait_any_owned(
+            root_dir=root_dir,
+            pool_id=pool_id,
+            timeout_seconds=timeout_seconds,
+            client=client,
+        )
+
+
+def _continue_pool_owned(
+    *,
+    root_dir: Path | str,
+    pool_id: str,
+    candidate_id: str,
+    worker_budget: dict[str, Any] | None = None,
+    final_verify: bool = True,
+    client: AgentPosixSdkClient | None = None,
+) -> dict[str, Any]:
+    sdk = client or AgentPosixSdkClient()
+    runtime = FileSearchRuntime(root_dir)
+    with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+        pool = _load_pool(root_dir, pool_id)
+        if pool.get("state") != "open":
+            raise RuntimeError("cannot continue a closed pi-thinkthread pool")
+        candidate_jobs = [
+            job for job in _jobs(root_dir, pool) if job.get("candidate_id") == candidate_id
+        ]
+        if not candidate_jobs:
+            raise ValueError(f"candidate {candidate_id} is not in pool {pool_id}")
+        if any(job.get("status") in ACTIVE_STATES for job in candidate_jobs):
+            raise RuntimeError(f"candidate {candidate_id} already has an active dispatch")
+        prior = candidate_jobs[-1]
+        child_id = prior.get("thinkthread_id")
+        branch_id = prior.get("fs_branch_id")
+        if not isinstance(child_id, str) or not isinstance(branch_id, str):
+            raise RuntimeError("candidate has no retained ThinkThread Child")
+        session = runtime.continue_agent_session(
+            str(prior["agent_session_id"]),
+            worker_budget=worker_budget,
+        )
+        resolved_budget = _budget_from_launch(session.launch)
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        job = {
+            **prior,
+            "job_id": job_id,
+            "status": "starting",
+            "dispatch_index": int(prior.get("dispatch_index", 1)) + 1,
+            "message_cursor": prior.get("message_cursor"),
+            "settled_requests": dict(prior.get("settled_requests") or {}),
+            "created_at": utc_timestamp(),
+            "updated_at": utc_timestamp(),
+            "started_at": None,
+            "finished_at": None,
+            "delivered_at": None,
+            "error": None,
+            "final_verify": bool(final_verify),
+            "worker_budget": resolved_budget,
+            "lease_started_unix": time.time(),
+            "lease_start_verifier_runs": int(prior.get("verifier_runs", 0)),
+            "lease_wakes": 0,
+            "restore_required": None,
+            "copy_requirements": [],
+        }
+        _write_job(root_dir, pool_id, job)
+        pool["jobs"].append(job_id)
+        _write_pool(root_dir, pool)
+    _send_retained_wake(
+        sdk=sdk,
+        root_dir=root_dir,
+        pool_id=pool_id,
+        job=job,
+        message=str(session.launch["message"]),
+        stage="continue_wake",
+    )
+    return {
+        "pool_id": pool_id,
+        "job_id": job_id,
+        "candidate_id": candidate_id,
+        "status": job["status"],
+        "thinkthread_id": child_id,
+        "fs_branch_id": branch_id,
+    }
+
+
+def continue_pool(
+    *,
+    root_dir: Path | str,
+    pool_id: str,
+    candidate_id: str,
+    worker_budget: dict[str, Any] | None = None,
+    final_verify: bool = True,
+    client: AgentPosixSdkClient | None = None,
+) -> dict[str, Any]:
+    with _TryControllerLock(
+        _controller_lock_path(root_dir, pool_id)
+    ) as acquired:
+        if not acquired:
+            raise RuntimeError(
+                f"pi-thinkthread pool {pool_id} controller is busy"
+            )
+        return _continue_pool_owned(
+            root_dir=root_dir,
+            pool_id=pool_id,
+            candidate_id=candidate_id,
+            worker_budget=worker_budget,
+            final_verify=final_verify,
+            client=client,
+        )
+
+
+def snapshot_pool(*, root_dir: Path | str, pool_id: str) -> dict[str, Any]:
+    with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+        pool = _load_pool(root_dir, pool_id)
+        jobs = _jobs(root_dir, pool)
+    active = [job for job in jobs if job.get("status") in ACTIVE_STATES]
+    terminal = [job for job in jobs if job.get("status") in TERMINAL_STATES]
+    undelivered = [job for job in terminal if not job.get("delivered_at")]
+    max_parallel = int(pool.get("max_parallel") or 0)
+    return {
+        "schema_version": pool.get("schema_version"),
+        "pool_id": pool_id,
+        "host": "pi-thinkthread",
+        "run_id": pool.get("run_id"),
+        "state": pool.get("state"),
+        "root_thinkthread_id": pool.get("root_thinkthread_id"),
+        "baseline_snapshot_id": pool.get("baseline_snapshot_id"),
+        "max_parallel": max_parallel,
+        "active_count": len(active),
+        "free_slots": max(0, max_parallel - len(active)),
+        "terminal_count": len(terminal),
+        "undelivered_count": len(undelivered),
+        "undelivered_terminal_count": len(undelivered),
+        "cleanup_observation": pool.get("cleanup_observation"),
+        "jobs": [
+            {
+                key: job.get(key)
+                for key in (
+                    "job_id",
+                    "candidate_id",
+                    "agent_session_id",
+                    "status",
+                    "dispatch_index",
+                    "thinkthread_id",
+                    "fs_branch_id",
+                    "verifier_runs",
+                    "error",
+                )
+            }
+            for job in jobs
+        ],
+    }
