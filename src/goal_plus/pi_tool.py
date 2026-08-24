@@ -26,6 +26,7 @@ SEARCH_TOOL_NAMES = {
     "search_create",
     "search_invalidate_run",
     "search_status",
+    "search_recover_pi_thinkthread",
     "search_list_history",
     "search_plan_next",
     "search_start_batch",

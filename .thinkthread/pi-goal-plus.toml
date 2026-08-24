@@ -1,0 +1,70 @@
+# Reusable Goal Plus Profile for ThinkThread + Pi.
+#
+# Install this file as:
+#   ~/.config/thinkthread/profiles/pi-goal-plus.toml
+#
+# Goal Plus assets and the official Agent POSIX SDK are installed by
+# scripts/install_pi_goal_plus_thinkthread.sh under ~/.local/share/goal-plus.
+# The Profile deliberately reuses Pi's normal models/auth/settings directory
+# without installing the Goal Plus Extension or skill into that directory.
+
+schemaVersion = 4
+
+[agent]
+name = "pi"
+executable = "pi"
+executableSearchPaths = [
+    "${HOME}/.local/share/pi-node/current/bin",
+    "${HOME}/.local/node_modules/.bin",
+    "${HOME}/.local/bin",
+    "${HOME}/.npm-global/bin",
+    "${HOME}/.bun/bin",
+]
+# The managed Pi installation keeps both the Node interpreter and packages
+# below this ancestor.  Reading only node_modules leaves the shebang's `node`
+# executable outside Sandlock and the Agent exits 127 before TUI readiness.
+executableReadAncestor = "pi-node"
+args = [
+    "--extension", "${HOME}/.local/share/goal-plus/pi/goal-plus.ts",
+    "--skill", "${HOME}/.local/share/goal-plus/pi/goal-plus/SKILL.md",
+]
+configDirEnv = "PI_CODING_AGENT_DIR"
+configDirDefault = "${HOME}/.pi/agent"
+configDirAccess = "read_write"
+
+[agent.extension]
+schemaVersion = 1
+name = "pi"
+
+[agent.extension.loader]
+kind = "process"
+command = ["thinkthread-extension-pi"]
+protocolVersion = 4
+
+[environment]
+fs = "."
+rootFsMode = "direct"
+childFsMode = "copy_on_write"
+read = [
+    "${HOME}/.local/share/goal-plus",
+    "/sys/devices/system/cpu",
+]
+write = []
+
+[environment.root]
+GOAL_PLUS_PI_ROLE = "main"
+GOAL_PLUS_ROOT = "${PI_CODING_AGENT_SESSION_DIR}/goal-plus"
+GOAL_PLUS_PI_TOOL = "${HOME}/.local/share/goal-plus/bin/goal-plus-pi-tool"
+GOAL_PLUS_AGENT_POSIX_SDK_ENTRY = "${HOME}/.local/share/goal-plus/node_modules/@thinkthread/agent-posix/dist/index.js"
+GOAL_PLUS_AGENT_POSIX_BRIDGE = "${HOME}/.local/share/goal-plus/bridge/thinkthread-agent-posix-bridge.mjs"
+GOAL_PLUS_PI_WORKER_PROMPT = "${HOME}/.local/share/goal-plus/pi/search-candidate-worker-thinkthread.md"
+
+[environment.child]
+GOAL_PLUS_PI_ROLE = "worker"
+GOAL_PLUS_AGENT_POSIX_SDK_ENTRY = "${HOME}/.local/share/goal-plus/node_modules/@thinkthread/agent-posix/dist/index.js"
+
+[environment.network]
+mode = "all"
+
+[delegation.capabilities]
+allow = ["thinkthread.message"]
