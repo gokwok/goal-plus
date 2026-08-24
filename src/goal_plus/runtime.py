@@ -4513,6 +4513,209 @@ class FileSearchRuntime:
             self._write_candidate_record(run_id, record)
             self._write_run(run)
 
+    def _pi_tool_copy_mutations(
+        self,
+        *,
+        run: RunRecord,
+        record: CandidateRecord,
+        receipt: ToolCopyReceipt,
+    ) -> list[dict[str, Any]]:
+        tool = self._resolve_shared_tool(
+            run.run_id,
+            receipt.tool_id,
+            receipt.snapshot_hash,
+        )
+        manager = SharedDirManager(self._run_dir(run.run_id))
+        manager.tool_view_input(tool, max_content_bytes=0)
+        destination_root = PurePosixPath(
+            self._fs_join_path(
+                run.fs_source_relative_path or ".",
+                f"{TOOL_INBOX_RELATIVE_PATH}/{receipt.receipt_id}",
+            )
+        )
+        directories: set[PurePosixPath] = set()
+        mutations: list[dict[str, Any]] = []
+        source_root = tool.read_only_path.resolve(strict=True)
+        copied_bytes = 0
+        for relative_text in tool.files:
+            relative = PurePosixPath(relative_text)
+            source = (source_root / Path(relative_text)).resolve(strict=True)
+            if not source.is_file() or not source.is_relative_to(source_root):
+                raise ValueError("shared tool source escaped immutable snapshot")
+            target = destination_root / relative
+            parent = target.parent
+            while str(parent) not in {"", "."}:
+                directories.add(parent)
+                parent = parent.parent
+            data = source.read_bytes()
+            copied_bytes += len(data)
+            if copied_bytes > tool.size_bytes:
+                raise ValueError("shared tool changed during copy preparation")
+            mutations.append(
+                {
+                    "kind": "put_file",
+                    "path": target.as_posix(),
+                    "dataBase64": base64.b64encode(data).decode("ascii"),
+                    "mode": source.stat().st_mode & 0o777,
+                }
+            )
+        if copied_bytes != tool.size_bytes:
+            raise ValueError("shared tool copy byte count mismatch")
+        return [
+            {
+                "kind": "make_directory",
+                "path": path.as_posix(),
+                "mode": 0o755,
+            }
+            for path in sorted(directories, key=lambda item: len(item.parts))
+        ] + mutations
+
+    def patch_pi_thinkthread_tool_copy(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        receipt_id: str,
+        source_snapshot_id: str,
+        client: AgentPosixSdkClient,
+    ) -> tuple[str, str]:
+        run = self._load_run(run_id)
+        record = self._load_candidate_record(run_id, candidate_id)
+        receipt = next(
+            (item for item in record.pending_tool_copies if item.receipt_id == receipt_id),
+            None,
+        )
+        if receipt is None:
+            raise RuntimeError(f"unknown pending tool copy receipt: {receipt_id}")
+        existing = next(
+            (
+                item
+                for item in run.fs_requests
+                if item.operation == "snapshot_patch"
+                and item.context.get("receipt_id") == receipt_id
+            ),
+            None,
+        )
+        if existing is None:
+            request_id = new_request_id()
+            now = utc_timestamp()
+            existing = FsRequestRecord(
+                request_id=request_id,
+                operation="snapshot_patch",
+                context={
+                    "candidate_id": candidate_id,
+                    "receipt_id": receipt_id,
+                    "source_snapshot_id": source_snapshot_id,
+                },
+                created_at=now,
+                updated_at=now,
+            )
+            self._append_fs_request(run_id, existing)
+        elif existing.context.get("source_snapshot_id") != source_snapshot_id:
+            raise RuntimeError("tool copy patch source snapshot changed during recovery")
+        request_id = existing.request_id
+        result = existing.result if existing.state in {"succeeded", "closed"} else None
+        params = {
+            "snapshotId": source_snapshot_id,
+            "requestId": request_id,
+            "mutations": self._pi_tool_copy_mutations(
+                run=run,
+                record=record,
+                receipt=receipt,
+            ),
+        }
+        if result is None:
+            if existing.state in {"accepted", "running", "needs_recovery"}:
+                result = self._recover_fs_request_result(
+                    client=client,
+                    run_id=run_id,
+                    request_id=request_id,
+                    operation="fs.snapshot.patch",
+                    deadline=time.monotonic() + 120.0,
+                )
+            if result is None:
+                try:
+                    result = client.invoke(
+                        "workflow.fs.snapshot.patchBytes",
+                        params,
+                        timeout_seconds=120.0,
+                    )
+                except AgentPosixBridgeError as exc:
+                    if not exc.completion_unknown and exc.code != "RequestInProgress":
+                        self._update_fs_request(
+                            run_id,
+                            request_id,
+                            state="failed",
+                            error={"message": str(exc), "code": exc.code},
+                        )
+                        raise
+                    result = self._recover_fs_request_result(
+                        client=client,
+                        run_id=run_id,
+                        request_id=request_id,
+                        operation="fs.snapshot.patch",
+                        deadline=time.monotonic() + 120.0,
+                    )
+                    if result is None:
+                        raise RuntimeError(
+                            "ThinkThread tool copy patch outcome is not recoverable"
+                        ) from exc
+                else:
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="succeeded",
+                        result=result,
+                    )
+        snapshot = result.get("snapshot") if isinstance(result, dict) else None
+        target_snapshot_id = (
+            snapshot.get("snapshotId") if isinstance(snapshot, dict) else None
+        )
+        if not isinstance(target_snapshot_id, str):
+            raise RuntimeError("fs.snapshot.patch omitted target snapshot")
+        return request_id, target_snapshot_id
+
+    def complete_pi_thinkthread_tool_copy(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        receipt_id: str,
+        target_snapshot_id: str,
+        request_id: str,
+        client: AgentPosixSdkClient,
+    ) -> None:
+        target = FsSnapshotArtifactRef(snapshot_id=target_snapshot_id)
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            record = self._load_candidate_record(run_id, candidate_id)
+            receipt = next(
+                (
+                    item
+                    for item in record.pending_tool_copies
+                    if item.receipt_id == receipt_id
+                ),
+                None,
+            )
+            if receipt is None:
+                raise RuntimeError("tool copy receipt disappeared before settlement")
+            receipt.target_snapshot_id = target_snapshot_id
+            record.settled_artifact_ref = target
+            run.fs_cleanup.append(
+                {
+                    "kind": "tool_copy",
+                    "state": "applied",
+                    "candidate_id": candidate_id,
+                    "receipt_id": receipt_id,
+                    "request_id": request_id,
+                    "target_snapshot_id": target_snapshot_id,
+                    "applied_at": utc_timestamp(),
+                }
+            )
+            self._write_candidate_record(run_id, record)
+            self._write_run(run)
+        self._close_fs_requests_after_evidence(run_id, [request_id], client)
+
     def _settle_process_verifier(
         self,
         *,
