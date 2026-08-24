@@ -272,6 +272,41 @@ turn-level Goal Plus stop gate through the extension `agent_end` event, but no
 host process Stop hook. Debug Goal Plus completion through extension pre-tool
 guard events, stop continuation messages, and `.gp/goal-plus/...`.
 
+### Pi ThinkThread
+
+Start with the same read-only `goal_plus_monitor_snapshot`, then correlate its
+`run_id`, `candidate_id`, `agent_session_id`, exact `fs_snapshot` ArtifactRefs,
+publication intent, `fs_requests`, and `fs_cleanup` with the native tree:
+
+```bash
+tt ps --forest
+goal-plus-pi-tool goal_plus_monitor_snapshot \
+  --root "$PI_CODING_AGENT_SESSION_DIR/goal-plus" \
+  --args-json '{"run_id":"run_..."}' --pretty
+```
+
+The Root pool record is under
+`${GOAL_PLUS_ROOT}/host-pools/pi/<pool_id>/`. Each job durably binds one Child,
+private `fsBranchId`, candidate, agent session, Message cursor, dispatch nonce,
+settled request replay, verifier/restore intent, and wake outcome. Treat the
+native Child/branch as host lifecycle state and the Goal Plus candidate record
+as business Evidence; neither is a substitute for the other.
+
+For a stuck run, inspect in this order:
+
+1. pool `state`, `active_count`, `undelivered_terminal_count`, and job error;
+2. `tt ps --forest` for the exact Child and execution state;
+3. Message cursor/registration/dispatch acknowledgement and sender binding;
+4. durable `fs.request.status` facts projected in the run;
+5. snapshot cleanup summary and the final `fs.stat.storage` observation.
+
+Never retry an outcome-unknown fs operation with a new RequestId. Current fs v1
+also makes `fs.snapshot.create` and `fs.branch.snapshot` durable: Goal Plus
+persists their caller-owned RequestId before capture, then uses
+`fs.request.status` or an idempotent replay with that same ID. After a Goal Plus
+process crash, run `search_recover_pi_thinkthread(run_id)` from the Root Profile;
+it binds the exact recovered snapshot before closing the terminal request.
+
 ## `.gp/` Layout
 
 ```

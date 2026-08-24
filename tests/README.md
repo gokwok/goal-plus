@@ -12,11 +12,19 @@ the only evidence that a real host can complete the user-visible workflow.
 | Example slice | `pytest -m example -q` | `examples/*` fixtures drive real generated assets |
 | Codex fast slice | `pytest -m codex -q` | Codex adapter, hooks, assets, pool contract |
 | Pi fast slice | `pytest -m pi -q` | Pi extension, driver, supervisor, assets |
+| Pi ThinkThread focused | `pytest tests/test_thinkthread_*.py -q` | Profile/SDK contract, Message pool, exact fs artifacts, recovery and cleanup with stateful fakes |
 | Runtime-focused | `pytest tests/test_runtime_unit.py` | Search state machine without a host |
 | Real-host ST | `pytest -m "(st and (st_codex or st_pi_rpc)) or st_pi" -v -s` | maintained native launch, hooks/events, worker lifecycle, final evidence |
 
 Default tests must never launch Codex or Pi. A host behavior claim requires
 the matching ST; if it cannot run, report that gap.
+
+The host-free ThinkThread tests also never open an Agent Control socket. A real
+claim requires launching `tt pi-goal-plus` inside Orb and checking native
+Children/branches, exact snapshot verifier Evidence, strict publication, and
+post-close storage cleanup. The maintained contract and diagnosis flow are in
+[`docs/pi.md`](../docs/pi.md#thinkthread-profile) and
+[`docs/debugging-runtime.md`](../docs/debugging-runtime.md#pi-thinkthread).
 With the `dev` extra installed, `pytest -n 2 --dist=load -q` runs the default
 gate with two workers. Keep real-host ST serial so host processes, model calls,
 and machine resources do not interfere with one another.

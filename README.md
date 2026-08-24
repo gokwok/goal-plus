@@ -27,6 +27,20 @@ Every host launches the same stdio MCP server:
 goal-plus --root .gp
 ```
 
+For the isolated Pi + ThinkThread host, install the reusable Profile and its
+self-contained Goal Plus/official Agent POSIX SDK assets, then launch it from
+the target workspace:
+
+```bash
+./scripts/install_pi_goal_plus_thinkthread.sh \
+  --thinkthread-source "$HOME/code/work/thinkthread"
+cd /path/to/target-workspace
+tt pi-goal-plus
+```
+
+This Profile reuses normal Pi models/auth/settings without installing Goal Plus
+into ordinary Pi configuration. See [Pi](docs/pi.md#thinkthread-profile).
+
 Then start a goal in the host:
 
 ```text
@@ -56,6 +70,7 @@ stored as guidance in the final line of `raw_goal`, not as a scheduler state.
 | Host | Project assets | Entry | Search worker path |
 |---|---|---|---|
 | Pi | `.pi/` | `/goal-plus` or `pi -p "/goal-plus ..."` | durable Pi RPC pool; see [Pi](docs/pi.md) |
+| Pi + ThinkThread | `.pi/`, `.thinkthread/` | `tt pi-goal-plus`, then `/goal-plus ...` | retained Message-only Child Sessions on private fs branches; see [Pi setup and behavior](docs/pi.md#thinkthread-profile) |
 | Codex | `.codex/` | `goal-plus` skill or `/goal-plus` prompt | fixed parallel loops with native same-worker continuation; Codex 0.144.1+ hooks cover `UserPromptSubmit`, `PreToolUse`, and `SubagentStop`; see [Codex](docs/codex.md) |
 
 For Codex, copy `.codex/config.example.toml` to the ignored local
@@ -73,7 +88,8 @@ For Codex, copy `.codex/config.example.toml` to the ignored local
   with verifier history.
 - A **worker session** is a host context/provenance handle. Worker lifecycle
   belongs to the host, not the Search runtime.
-- The **shared plane** contains the frozen contract, exact verifier commits,
+- The **shared plane** contains the frozen contract, exact verifier artifacts
+  (`git_commit` or `fs_snapshot`),
   Global Evidence, asynchronous objective Views, and selection state. It does
   not expose peer reasoning or peer workspaces.
 - A **verifier concern** is worker advice. Only the main agent can confirm it;
@@ -97,9 +113,10 @@ is only the compatibility view of the current task.
 When `promotion_verifiers` are configured, promotion is an independent check,
 not a cached pass-through. The runtime checks out the selected verifier-backed
 revision, reruns each promotion gate with
-`GOAL_PLUS_VERIFIER_PHASE=promotion`, binds the evidence to the selected Git
-head and artifact hash, and only then emits a Git-applyable patch. A failed
-promotion stays retryable in `ready_to_promote` and emits no patch.
+`GOAL_PLUS_VERIFIER_PHASE=promotion`, and binds the evidence to the selected
+exact artifact. Git-backed hosts then emit a Git-applyable patch;
+`pi-thinkthread` performs strict baseline-to-selected snapshot publication. A
+failed promotion stays retryable in `ready_to_promote` and emits no output.
 
 ## Documentation
 
