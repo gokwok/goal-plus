@@ -5237,6 +5237,7 @@ class FileSearchRuntime:
             self._write_agent_session(latest_session)
         self._close_fs_requests_after_evidence(run.run_id, request_ids, client)
         return report
+
     def _settle_process_verifier(
         self,
         *,
@@ -5335,6 +5336,9 @@ class FileSearchRuntime:
                         candidate_id=candidate_id,
                         iteration=iteration_number,
                         source_commit=attempt.git_head,
+                        source_artifact_ref=GitCommitArtifactRef(
+                            commit=attempt.git_head
+                        ),
                         share_out_dir=record.task.share_out_dir,
                         max_tools=limits.max_tools_per_iteration,
                         max_files=limits.max_files_per_iteration,
@@ -5382,6 +5386,10 @@ class FileSearchRuntime:
                 model_provenance=(session.model_provenance if session else {}),
                 score=report.aggregate_score,
                 process_passed=report.process_passed,
+                attempt_base_ref=GitCommitArtifactRef(
+                    commit=pre_attempt_settled_head
+                ),
+                attempt_ref=GitCommitArtifactRef(commit=attempt.git_head),
                 git_head=attempt.git_head,
                 attempt_base_git_head=pre_attempt_settled_head,
                 attempt_changed_files=attempt_changed_files,
@@ -5461,6 +5469,7 @@ class FileSearchRuntime:
 
             if disposition in {"keep", "retain"}:
                 best_iteration = iteration
+                settled_ref = iteration.attempt_ref
             else:
                 target = (
                     prior_best.git_head
@@ -5483,6 +5492,9 @@ class FileSearchRuntime:
                     ),
                 )
                 best_iteration = prior_best
+                settled_ref = GitCommitArtifactRef(commit=target)
+
+            iteration.settled_ref = settled_ref
 
             settled = self._candidate_artifact_state(run, frozen, record)
             if not settled.git_artifact_clean:
@@ -5498,6 +5510,7 @@ class FileSearchRuntime:
                 source_run_id=run_id,
                 source_candidate_id=candidate_id,
                 iteration=iteration_number,
+                artifact_ref=iteration.attempt_ref,
                 git_head=attempt.git_head,
                 metric_name=frozen.spec.metric_name,
                 score=report.aggregate_score,
@@ -5513,6 +5526,7 @@ class FileSearchRuntime:
             )
             iteration.ledger_git_head = ledger_git_head
             iteration.workspace_git_head_after_settlement = ledger_git_head
+            record.settled_artifact_ref = settled_ref
             record.iterations.append(iteration)
             if pending_tool_copies:
                 consumed = {item.receipt_id for item in pending_tool_copies}
@@ -5531,6 +5545,12 @@ class FileSearchRuntime:
                     "best_git_head": (
                         best_iteration.git_head if best_iteration is not None else None
                     ),
+                    "best_artifact_ref": (
+                        best_iteration.attempt_ref
+                        if best_iteration is not None
+                        else None
+                    ),
+                    "workspace_artifact_after_settlement": settled_ref,
                     "workspace_git_head_after_settlement": ledger_git_head,
                     "shared_tool_staged_entries": iteration.shared_tool_staged_entries,
                     "shared_tool_staged_file_count": iteration.shared_tool_staged_file_count,
