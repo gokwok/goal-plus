@@ -5107,8 +5107,136 @@ class FileSearchRuntime:
                 "toolization_advisories": iteration.toolization_advisories,
             }
         )
-        raise NotImplementedError
-
+        with self._run_transaction(run.run_id):
+            current_run = self._load_run(run.run_id)
+            if (
+                idempotency_key is not None
+                and current_run.state == RunState.NEEDS_RECOVERY
+            ):
+                replay_requests = [
+                    item
+                    for item in current_run.fs_requests
+                    if item.request_id in request_ids
+                ]
+                reason = str(
+                    current_run.budget_used.get("needs_recovery_reason") or ""
+                )
+                if (
+                    replay_requests
+                    and all(
+                        item.state
+                        in {"succeeded", "failed", "cancelled", "closed"}
+                        for item in replay_requests
+                    )
+                    and any(item.request_id in reason for item in replay_requests)
+                ):
+                    previous = current_run.budget_used.pop(
+                        "fs_recovery_previous_state", RunState.RUNNING.value
+                    )
+                    current_run.budget_used.pop("needs_recovery_reason", None)
+                    current_run.state = RunState(str(previous))
+            self._assert_worker_iteration_allowed(
+                current_run,
+                "record verifier result",
+            )
+            current_record = self._load_candidate_record(
+                run.run_id,
+                record.candidate_id,
+            )
+            current_record.detected_changed_files = list(attempt.changed_files)
+            current_record.touched_denied_files = attempt.touched_denied_files
+            current_record.changed_outside_allowed = attempt.changed_outside_allowed
+            current_record.iterations.append(iteration)
+            consumed_receipts = {
+                item.receipt_id
+                for item in record.pending_tool_copies
+                if item.target_snapshot_id is not None
+            }
+            if consumed_receipts:
+                current_record.pending_tool_copies = [
+                    item
+                    for item in current_record.pending_tool_copies
+                    if item.receipt_id not in consumed_receipts
+                ]
+            if shared_settlement is not None:
+                consumed_stage_names = {
+                    *shared_settlement.consumed_entries,
+                    *shared_settlement.deduplicated_entries,
+                }
+                current_record.pending_fs_tool_stages = [
+                    item
+                    for item in current_record.pending_fs_tool_stages
+                    if item.get("staged_name") not in consumed_stage_names
+                ]
+            current_record.results_ledger.append(
+                ResultLedgerEntry(
+                    source_run_id=run.run_id,
+                    source_candidate_id=record.candidate_id,
+                    iteration=iteration_number,
+                    artifact_ref=attempt.attempt_ref,
+                    metric_name=frozen.spec.metric_name,
+                    score=report.aggregate_score,
+                    status="pass" if report.process_passed else "fail",
+                    hypothesis=iteration_hypothesis,
+                    failure_class=failure_class,
+                    created_at=created_at,
+                )
+            )
+            current_record.status = "evaluated"
+            current_record.score_report = report
+            if disposition in {"keep", "retain"}:
+                current_record.settled_artifact_ref = settled_ref
+            else:
+                current_run.fs_cleanup.append(
+                    {
+                        "kind": "branch_restore",
+                        "state": "restore_required",
+                        "candidate_id": record.candidate_id,
+                        "branch_id": current_record.task.fs_branch_id,
+                        "attempt_snapshot_id": attempt.attempt_ref.snapshot_id,
+                        "target_snapshot_id": settled_ref.snapshot_id,
+                        "created_at": utc_timestamp(),
+                    }
+                )
+            self._write_candidate_record(run.run_id, current_record)
+            if self._update_best_seen(current_run, frozen.spec, report):
+                if best_iteration is None:
+                    raise RuntimeError("run best has no FsSnapshot iteration")
+                self._write_best_fs_artifact(
+                    current_run,
+                    frozen.spec,
+                    current_record,
+                    best_iteration,
+                )
+            current_run.candidates_evaluated = len(
+                [
+                    item
+                    for item in self._load_candidate_records(run.run_id)
+                    if item.status == "evaluated"
+                ]
+            )
+            self._write_run(current_run)
+            try:
+                self._create_evidence_annotation_task(
+                    run.run_id,
+                    frozen,
+                    record.candidate_id,
+                    iteration,
+                )
+            except Exception:
+                pass
+        if session is not None:
+            latest_session = self._load_agent_session_by_id(
+                session.agent_session_id,
+                run_id=run.run_id,
+            )
+            counters = dict(latest_session.counters)
+            counters["verifier_runs"] = counters.get("verifier_runs", 0) + 1
+            latest_session.counters = counters
+            latest_session.updated_at = utc_timestamp()
+            self._write_agent_session(latest_session)
+        self._close_fs_requests_after_evidence(run.run_id, request_ids, client)
+        return report
     def _settle_process_verifier(
         self,
         *,
