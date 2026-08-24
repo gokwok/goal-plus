@@ -126,6 +126,54 @@ def _write_tool(share_out: Path, name: str = "score-helper") -> None:
     )
 
 
+def test_settlement_receipts_survive_later_tool_publications(tmp_path: Path) -> None:
+    manager = SharedDirManager(tmp_path / "run")
+    first_share_out = tmp_path / "first" / ".tmp" / "share-out"
+    _write_tool(first_share_out, "first-helper")
+    first = manager.settle_iteration(
+        candidate_id="c001",
+        iteration=1,
+        source_commit="a" * 40,
+        share_out_dir=first_share_out,
+        max_tools=4,
+        max_files=16,
+        max_bytes=1024 * 1024,
+        max_path_entries=64,
+        max_depth=4,
+        settlement_id="request-first",
+    )
+    second_share_out = tmp_path / "second" / ".tmp" / "share-out"
+    _write_tool(second_share_out, "second-helper")
+    manager.settle_iteration(
+        candidate_id="c001",
+        iteration=2,
+        source_commit="b" * 40,
+        share_out_dir=second_share_out,
+        max_tools=4,
+        max_files=16,
+        max_bytes=1024 * 1024,
+        max_path_entries=64,
+        max_depth=4,
+        settlement_id="request-second",
+    )
+
+    index = json.loads(manager.index_path.read_text(encoding="utf-8"))
+    assert set(index["settlements"]) == {"request-first", "request-second"}
+    replayed = manager.settle_iteration(
+        candidate_id="c001",
+        iteration=1,
+        source_commit="a" * 40,
+        share_out_dir=first_share_out,
+        max_tools=4,
+        max_files=16,
+        max_bytes=1024 * 1024,
+        max_path_entries=64,
+        max_depth=4,
+        settlement_id="request-first",
+    )
+    assert replayed.tools[0].tool_id == first.tools[0].tool_id
+
+
 def _publish_pending_views(runtime: FileSearchRuntime, run_id: str) -> int:
     class PublishingAnnotator:
         def annotate(self, context):
@@ -273,7 +321,8 @@ def test_process_verifier_publishes_share_out_into_global_evidence(
     assert (snapshot / "score-helper" / "helper.py").is_file()
 
     index = _shared_index(runtime, run_id)
-    assert index["schema_version"] == 1
+    assert index["schema_version"] == 2
+    assert index["settlements"] == {}
     assert [item["tool_id"] for item in index["tools"]] == [tool["tool_id"]]
     iteration = _iterations(runtime, run_id, producer)[0]
     assert iteration["shared_tools"][0]["snapshot_hash"] == tool["snapshot_hash"]

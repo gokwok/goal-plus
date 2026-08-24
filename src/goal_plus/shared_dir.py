@@ -21,13 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
 
-from goal_plus.models import SharedToolRecord
+from goal_plus.models import ArtifactRef, SharedToolRecord
 
 
 SHARE_OUT_RELATIVE_PATH = ".tmp/share-out"
 TOOL_DRAFTS_RELATIVE_PATH = ".tmp/tool-drafts"
 TOOL_INBOX_RELATIVE_PATH = ".tmp/shared-tools"
-SHARED_INDEX_SCHEMA_VERSION = 1
+SHARED_INDEX_SCHEMA_VERSION = 2
 TOOL_VIEW_MAX_CONTENT_BYTES = 256 * 1024
 TOOL_VIEW_MAX_FILE_BYTES = 64 * 1024
 
@@ -635,12 +635,14 @@ class SharedDirManager:
         candidate_id: str,
         iteration: int,
         source_commit: str | None,
+        source_artifact_ref: ArtifactRef | None = None,
         share_out_dir: Path,
         max_tools: int,
         max_files: int,
         max_bytes: int,
         max_path_entries: int,
         max_depth: int,
+        settlement_id: str | None = None,
     ) -> SharedDirSettlement:
         """Atomically claim staging, publish deltas, and consume accepted input."""
         limits = _ToolLimits(
@@ -651,6 +653,14 @@ class SharedDirManager:
             max_depth=max_depth,
         )
         self.ensure_layout()
+        if settlement_id is not None:
+            recovered = self._load_settlement(
+                settlement_id,
+                candidate_id=candidate_id,
+                iteration=iteration,
+            )
+            if recovered is not None:
+                return recovered
         inventory = self.inspect_staging(
             share_out_dir,
             max_tools=limits.max_tools,
@@ -689,14 +699,24 @@ class SharedDirManager:
                         candidate_id=candidate_id,
                         iteration=iteration,
                         source_commit=source_commit,
+                        source_artifact_ref=source_artifact_ref,
                         limits=limits,
                     )
                 except (OSError, ValueError) as exc:
                     result.errors.append(f"{entry.name}: {exc}")
                     self._restore_entry(entry, share_out_dir, result.errors)
 
-            if batch.new_records:
-                self._append_index(batch.new_records)
+            result.tools = batch.new_records
+            result.staged_file_count = batch.usage.file_count
+            result.staged_bytes = batch.usage.size_bytes
+            if batch.new_records or settlement_id is not None:
+                self._append_index(
+                    batch.new_records,
+                    settlement_id=settlement_id,
+                    settlement=result,
+                    candidate_id=candidate_id,
+                    iteration=iteration,
+                )
         except Exception:
             # No index publication means none of this batch is durably settled.
             for entry in batch.processed_entries:
@@ -705,10 +725,6 @@ class SharedDirManager:
             for snapshot in reversed(batch.created_snapshots):
                 self._remove_unindexed_snapshot(snapshot)
             raise
-        else:
-            result.tools = batch.new_records
-            result.staged_file_count = batch.usage.file_count
-            result.staged_bytes = batch.usage.size_bytes
         finally:
             self._cleanup_claim(claim_dir, batch.processed_entries, result.errors)
         return result
@@ -722,6 +738,7 @@ class SharedDirManager:
         candidate_id: str,
         iteration: int,
         source_commit: str | None,
+        source_artifact_ref: ArtifactRef | None,
         limits: _ToolLimits,
     ) -> None:
         files, size_bytes, path_entries = self._tool_files(
@@ -748,6 +765,7 @@ class SharedDirManager:
                 candidate_id=candidate_id,
                 iteration=iteration,
                 source_commit=source_commit,
+                source_artifact_ref=source_artifact_ref,
                 tool=entry,
                 source_relative_path=source_relative_path,
                 files=files,
@@ -1121,6 +1139,7 @@ class SharedDirManager:
         candidate_id: str,
         iteration: int,
         source_commit: str | None,
+        source_artifact_ref: ArtifactRef | None,
         tool: Path,
         source_relative_path: str,
         files: list[Path],
@@ -1188,6 +1207,7 @@ class SharedDirManager:
             candidate_id=candidate_id,
             iteration=iteration,
             source_commit=source_commit,
+            source_artifact_ref=source_artifact_ref,
             snapshot_hash=snapshot_hash,
             name=name,
             summary=summary,
@@ -1337,28 +1357,114 @@ class SharedDirManager:
         except OSError:
             pass
 
-    def _append_index(self, tools: list[SharedToolRecord]) -> None:
-        existing = self._load_index()
+    @staticmethod
+    def _settlement_payload(result: SharedDirSettlement) -> dict[str, Any]:
+        return {
+            "tools": [item.model_dump(mode="json") for item in result.tools],
+            "errors": list(result.errors),
+            "staged_entries": list(result.staged_entries),
+            "staged_file_count": result.staged_file_count,
+            "staged_bytes": result.staged_bytes,
+            "consumed_entries": list(result.consumed_entries),
+            "deduplicated_entries": list(result.deduplicated_entries),
+        }
+
+    @staticmethod
+    def _settlement_from_payload(payload: dict[str, Any]) -> SharedDirSettlement:
+        return SharedDirSettlement(
+            tools=[
+                SharedToolRecord.model_validate(item)
+                for item in payload.get("tools", [])
+                if isinstance(item, dict)
+            ],
+            errors=[str(item) for item in payload.get("errors", [])],
+            staged_entries=[
+                str(item) for item in payload.get("staged_entries", [])
+            ],
+            staged_file_count=int(payload.get("staged_file_count", 0)),
+            staged_bytes=int(payload.get("staged_bytes", 0)),
+            consumed_entries=[
+                str(item) for item in payload.get("consumed_entries", [])
+            ],
+            deduplicated_entries=[
+                str(item) for item in payload.get("deduplicated_entries", [])
+            ],
+        )
+
+    def _load_index_payload(self) -> dict[str, Any]:
+        if not self.index_path.exists():
+            return {"tools": [], "settlements": {}}
+        payload = json.loads(self.index_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("tools"), list):
+            raise ValueError("shared tool index has an invalid shape")
+        if not isinstance(payload.get("settlements", {}), dict):
+            raise ValueError("shared tool settlement index has an invalid shape")
+        return payload
+
+    def _load_settlement(
+        self,
+        settlement_id: str,
+        *,
+        candidate_id: str,
+        iteration: int,
+    ) -> SharedDirSettlement | None:
+        receipt = self._load_index_payload().get("settlements", {}).get(settlement_id)
+        if receipt is None:
+            return None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("candidate_id") != candidate_id
+            or receipt.get("iteration") != iteration
+            or not isinstance(receipt.get("result"), dict)
+        ):
+            raise ValueError("shared tool settlement id is bound to another iteration")
+        return self._settlement_from_payload(receipt["result"])
+
+    def _append_index(
+        self,
+        tools: list[SharedToolRecord],
+        *,
+        settlement_id: str | None = None,
+        settlement: SharedDirSettlement | None = None,
+        candidate_id: str | None = None,
+        iteration: int | None = None,
+    ) -> None:
+        payload = self._load_index_payload()
+        existing = [item for item in payload["tools"] if isinstance(item, dict)]
         by_id = {item.get("tool_id"): item for item in existing}
         for tool in tools:
-            payload = tool.model_dump(mode="json")
-            by_id[payload["tool_id"]] = payload
-        self._write_index(list(by_id.values()))
+            tool_payload = tool.model_dump(mode="json")
+            by_id[tool_payload["tool_id"]] = tool_payload
+        settlements = dict(payload.get("settlements") or {})
+        if settlement_id is not None:
+            if settlement is None or candidate_id is None or iteration is None:
+                raise ValueError("shared tool settlement receipt is incomplete")
+            settlements[settlement_id] = {
+                "candidate_id": candidate_id,
+                "iteration": iteration,
+                "result": self._settlement_payload(settlement),
+                "recorded_at": _utc_timestamp(),
+            }
+        self._write_index(list(by_id.values()), settlements=settlements)
 
     def _load_index(self) -> list[dict[str, Any]]:
-        if not self.index_path.exists():
-            return []
-        payload = json.loads(self.index_path.read_text(encoding="utf-8"))
-        tools = payload.get("tools") if isinstance(payload, dict) else None
-        if not isinstance(tools, list):
-            raise ValueError("shared tool index has an invalid shape")
-        return [item for item in tools if isinstance(item, dict)]
+        return [
+            item
+            for item in self._load_index_payload()["tools"]
+            if isinstance(item, dict)
+        ]
 
-    def _write_index(self, tools: list[dict[str, Any]]) -> None:
+    def _write_index(
+        self,
+        tools: list[dict[str, Any]],
+        *,
+        settlements: dict[str, Any] | None = None,
+    ) -> None:
         self.shared_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": SHARED_INDEX_SCHEMA_VERSION,
             "tools": tools,
+            "settlements": settlements or {},
         }
         self.index_temp_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.index_temp_dir / (
