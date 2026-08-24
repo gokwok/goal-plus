@@ -748,3 +748,270 @@ class StatefulPoolAgentPosixClient(FakeVerifierAgentPosixClient):
         return super()._file(snapshot_id, path)
 
 
+def thinkthread_spec(project: Path) -> SearchSpec:
+    return SearchSpec.model_validate(
+        {
+            "objective": "test runtime",
+            "metric_name": "combined_score",
+            "metric_direction": "maximize",
+            "source_path": str(project),
+            "edit_surface": {
+                "allow": ["initial_program.py"],
+                "deny": ["evaluator.py", "config.yaml"],
+            },
+            "budget": {"max_parallel": 2},
+            "process_verifiers": [
+                {
+                    "name": "score",
+                    "role": "ranking_signal",
+                    "command": ["python", "evaluator.py"],
+                    "timeout_seconds": 30,
+                }
+            ],
+            "strategy": {
+                "name": "random",
+                "worker_host": "pi-thinkthread",
+                "worker_budget": {
+                    "max_runtime_seconds": 300,
+                    "on_exceed": "interrupt",
+                },
+            },
+            "shared_dir": {"enabled": True},
+        }
+    )
+
+
+def worker_request(
+    *,
+    request_id: str,
+    agent_session_id: str,
+    tool: str,
+    params: dict,
+) -> dict:
+    content = {
+        "agent_session_id": agent_session_id,
+        "tool": tool,
+        "params": params,
+    }
+    content_json = json.dumps(
+        content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "protocol": "goal-plus.pi-thinkthread.v2",
+        "type": "request",
+        "request_id": request_id,
+        **content,
+        "content_json": content_json,
+        "content_sha256": hashlib.sha256(
+            content_json.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def test_worker_rpc_content_hash_accepts_unicode_and_json_number_spelling() -> None:
+    request = worker_request(
+        request_id="request-unicode",
+        agent_session_id="session-unicode",
+        tool="search_run_verifier",
+        params={"hypothesis": "优化性能", "future_numeric_value": 1.0e-7},
+    )
+
+    assert _request_hash(request) == request["content_sha256"]
+
+
+def test_second_pool_controller_does_not_process_the_same_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+
+    with _TryControllerLock(
+        _controller_lock_path(runtime.root_dir, opened["pool_id"])
+    ) as acquired:
+        assert acquired is True
+        result = wait_any(
+            root_dir=runtime.root_dir,
+            pool_id=opened["pool_id"],
+            timeout_seconds=0,
+            client=client,
+        )
+        with pytest.raises(RuntimeError, match="controller is busy"):
+            continue_pool(
+                root_dir=runtime.root_dir,
+                pool_id=opened["pool_id"],
+                candidate_id=task.candidate_id,
+                client=client,
+            )
+        with pytest.raises(RuntimeError, match="controller is busy"):
+            close_pool(
+                root_dir=runtime.root_dir,
+                pool_id=opened["pool_id"],
+                mode="interrupt",
+                client=client,
+            )
+
+    assert result["event"] is None
+    assert result["controller_busy"] is True
+    assert not any(operation == "message.receive" for operation, _ in client.operations)
+
+
+@pytest.mark.pi
+def test_run_baseline_and_candidates_use_one_exact_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    run = runtime._load_run(run_id)
+    plan = runtime.plan_next(run_id, requested_k=2)
+    tasks = runtime.start_batch(run_id, plan.plan_id)
+
+    assert run.baseline_artifact_ref == FsSnapshotArtifactRef(
+        snapshot_id="fsnap-baseline"
+    )
+    assert run.fs_source_relative_path == "."
+    baseline_request = run.fs_requests[0]
+    assert baseline_request.operation == "root_snapshot"
+    assert baseline_request.state == "closed"
+    assert client.operations == [
+        ("fs.stat", {}),
+        (
+            "fs.snapshot.create",
+            {"requestId": baseline_request.request_id},
+        ),
+        ("fs.request.close", {"requestId": baseline_request.request_id}),
+    ]
+    assert len(tasks) == 2
+    assert {task.fs_base_snapshot_id for task in tasks} == {"fsnap-baseline"}
+    assert all(task.workspace is None for task in tasks)
+    assert all(task.workspace_backend is None for task in tasks)
+    assert not (project / ".gp-test" / "runs" / run_id / "workspace").exists()
+
+
+@pytest.mark.pi
+def test_root_snapshot_completion_unknown_recovers_by_persisted_request_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    client.snapshot_create_completion_unknown_once = True
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    run = runtime._load_run(run_id)
+    request = run.fs_requests[0]
+    intent = run.fs_snapshot_intents[0]
+
+    assert request.operation == "root_snapshot"
+    assert request.state == "closed"
+    assert request.result == {
+        "snapshotId": "fsnap-baseline",
+        "ownerThinkthreadId": "tt-root",
+        "createdAtUnixMs": 1,
+        "logicalBytes": 10,
+    }
+    assert intent.request_id == request.request_id
+    assert intent.snapshot_id == "fsnap-baseline"
+    assert [
+        params["requestId"]
+        for operation, params in client.operations
+        if operation == "fs.snapshot.create"
+    ] == [request.request_id]
+    assert (
+        "fs.request.status",
+        {"requestId": request.request_id},
+    ) in client.operations
+
+
+@pytest.mark.pi
+def test_root_snapshot_request_recovers_after_goal_plus_process_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+
+    with runtime._run_transaction(run_id):
+        run = runtime._load_run(run_id)
+        request = run.fs_requests[0]
+        request.state = "prepared"
+        request.result = None
+        request.closed_at = None
+        intent = run.fs_snapshot_intents[0]
+        intent.state = "platform_mutation_started"
+        intent.snapshot_id = None
+        run.baseline_artifact_ref = None
+        run.state = RunState.NEEDS_RECOVERY
+        run.budget_used["fs_recovery_previous_state"] = RunState.RUNNING.value
+        run.budget_used["needs_recovery_reason"] = (
+            f"fs.snapshot.create request {request.request_id} simulated process crash"
+        )
+        runtime._write_run(run)
+    result = {
+        "snapshotId": "fsnap-baseline",
+        "ownerThinkthreadId": "tt-root",
+        "createdAtUnixMs": 1,
+        "logicalBytes": 10,
+    }
+    client.fs_request_status[request.request_id] = {
+        "requestId": request.request_id,
+        "method": "fs.snapshot.create",
+        "state": "succeeded",
+        "acceptedAtUnixMs": 1,
+        "finishedAtUnixMs": 2,
+        "result": result,
+        "error": None,
+    }
+
+    recovered = runtime.recover_pi_thinkthread_snapshot_requests(run_id)
+
+    run = runtime._load_run(run_id)
+    assert recovered["failed"] == []
+    assert recovered["resolved"] == [
+        {
+            "request_id": request.request_id,
+            "snapshot_id": "fsnap-baseline",
+        }
+    ]
+    assert run.state == RunState.RUNNING
+    assert run.baseline_artifact_ref == FsSnapshotArtifactRef(
+        snapshot_id="fsnap-baseline"
+    )
+    assert run.fs_requests[0].state == "closed"
+    assert run.fs_snapshot_intents[0].snapshot_id == "fsnap-baseline"
+
+
+@pytest.mark.pi
