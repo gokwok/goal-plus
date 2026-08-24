@@ -10269,14 +10269,23 @@ class FileSearchRuntime:
     ) -> tuple[ResolvedEvidenceAnnotatorProfile | None, str | None]:
         strategy = frozen.spec.strategy
         configured = strategy.evidence_annotator
-        annotation_host = configured.host or strategy.worker_host
+        requested_annotation_host = configured.host or strategy.worker_host
+        inherits_worker_model = requested_annotation_host == strategy.worker_host
+        # ThinkThread Candidate work stays on private fs branches, but Evidence
+        # annotation is a text-only, tool-free Root-side Pi process over already
+        # materialized JSON. It never creates a Candidate workspace or reads Git.
+        annotation_host = (
+            "pi-rpc"
+            if requested_annotation_host == "pi-thinkthread"
+            else requested_annotation_host
+        )
         worker_launch = strategy.worker_launch
         env_model = os.environ.get(EVIDENCE_ANNOTATOR_MODEL_ENV)
         if configured.model:
             model = configured.model
-        elif annotation_host == strategy.worker_host and selected_model:
+        elif inherits_worker_model and selected_model:
             model = selected_model
-        elif annotation_host == strategy.worker_host and worker_launch is not None:
+        elif inherits_worker_model and worker_launch is not None:
             model = worker_launch.model
         elif env_model:
             model = env_model.strip() or None
@@ -10288,7 +10297,7 @@ class FileSearchRuntime:
         reasoning_effort = configured.reasoning_effort
         if (
             reasoning_effort is None
-            and annotation_host == strategy.worker_host
+            and inherits_worker_model
             and worker_launch is not None
         ):
             reasoning_effort = worker_launch.reasoning_effort
@@ -10396,11 +10405,16 @@ class FileSearchRuntime:
         candidate_id: str,
         iteration: IterationRecord,
     ) -> EvidenceAnnotationTask:
-        if (
-            iteration.git_head is None
-            or iteration.attempt_base_git_head is None
-        ):
-            raise RuntimeError("worker Evidence requires exact attempt commits")
+        has_git_artifacts = (
+            iteration.git_head is not None
+            and iteration.attempt_base_git_head is not None
+        )
+        has_generic_artifacts = (
+            iteration.attempt_ref is not None
+            and iteration.attempt_base_ref is not None
+        )
+        if not has_git_artifacts and not has_generic_artifacts:
+            raise RuntimeError("worker Evidence requires exact attempt artifacts")
         existing = self._load_evidence_annotation_task(
             run_id, candidate_id, iteration.iteration
         )
@@ -10409,6 +10423,8 @@ class FileSearchRuntime:
                 existing.attempt_commit != iteration.git_head
                 or existing.attempt_base_commit
                 != iteration.attempt_base_git_head
+                or existing.attempt_ref != iteration.attempt_ref
+                or existing.attempt_base_ref != iteration.attempt_base_ref
             ):
                 raise RuntimeError("Evidence annotation task is immutable")
             return existing
@@ -10448,6 +10464,8 @@ class FileSearchRuntime:
             run_id=run_id,
             candidate_id=candidate_id,
             iteration=iteration.iteration,
+            attempt_base_ref=iteration.attempt_base_ref,
+            attempt_ref=iteration.attempt_ref,
             attempt_base_commit=iteration.attempt_base_git_head,
             attempt_commit=iteration.git_head,
             attempt_changed_files=list(iteration.attempt_changed_files),
@@ -10487,6 +10505,11 @@ class FileSearchRuntime:
         entry = {
             "candidate_id": candidate_id,
             "iteration": iteration.iteration,
+            "artifact_ref": (
+                iteration.attempt_ref.model_dump(mode="json")
+                if iteration.attempt_ref is not None
+                else None
+            ),
             "commit": iteration.git_head,
             "score": iteration.score,
             "disposition": iteration.disposition,
@@ -10534,6 +10557,10 @@ class FileSearchRuntime:
                 or view.candidate_id != candidate_id
                 or view.iteration != iteration.iteration
                 or view.attempt_commit != iteration.git_head
+                or (
+                    view.attempt_ref is not None
+                    and view.attempt_ref != iteration.attempt_ref
+                )
             ):
                 raise RuntimeError("evidence view does not match iteration")
             result.append(
@@ -10576,11 +10603,22 @@ class FileSearchRuntime:
             ):
                 continue
             for entry in evidence:
+                external_artifact_ref = artifact.get("artifact_ref")
+                entry_artifact_ref = entry.get("artifact_ref")
+                artifact_matches = (
+                    isinstance(external_artifact_ref, dict)
+                    and isinstance(entry_artifact_ref, dict)
+                    and external_artifact_ref == entry_artifact_ref
+                )
+                legacy_commit_matches = (
+                    external_artifact_ref is None
+                    and (entry.get("commit") or entry.get("git_head"))
+                    == artifact.get("commit")
+                )
                 if (
                     entry.get("candidate_id") == artifact.get("candidate_id")
                     and entry.get("iteration") == artifact.get("iteration")
-                    and (entry.get("commit") or entry.get("git_head"))
-                    == artifact.get("commit")
+                    and (artifact_matches or legacy_commit_matches)
                 ):
                     external = dict(evaluation)
                     source = payload.get("source")
