@@ -2194,3 +2194,292 @@ def test_shared_tool_is_published_from_the_exact_attempt_snapshot(
 
 
 @pytest.mark.pi
+def test_pool_message_rpc_replays_settled_request_and_closes_retained_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    snapshot = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    pool_id = snapshot["pool_id"]
+    job_id = snapshot["jobs"][0]["job_id"]
+    child_id = snapshot["jobs"][0]["thinkthread_id"]
+    assert isinstance(child_id, str)
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+    request = worker_request(
+        request_id="request-verifier-1",
+        agent_session_id=session.agent_session_id,
+        tool="search_run_verifier",
+        params={"hypothesis": "worker exact snapshot"},
+    )
+    client.enqueue(child_id, request)
+
+    first = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert first["event"] is None
+    assert len(runtime._load_candidate_record(run_id, task.candidate_id).iterations) == 1
+
+    client.enqueue(child_id, request)
+    second = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert second["event"] is None
+    assert len(runtime._load_candidate_record(run_id, task.candidate_id).iterations) == 1
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["message_cursor"] == "3"
+    assert list(job["settled_requests"]) == ["request-verifier-1"]
+    receive_calls = [
+        params
+        for operation, params in client.operations
+        if operation == "message.receive"
+    ]
+    assert receive_calls
+    assert {params["limit"] for params in receive_calls} == {32}
+    response_hash = job["pending_responses"]["request-verifier-1"][
+        "response_sha256"
+    ]
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "response_ack",
+            "request_id": "request-verifier-1",
+            "response_sha256": response_hash,
+        },
+    )
+    client.message_index += 1
+    client.messages[child_id].append(
+        {
+            "messageId": f"msg-worker-{client.message_index}",
+            "senderThinkthreadId": child_id,
+            "text": "Candidate turn completed after verifier settlement.",
+            "truncated": False,
+        }
+    )
+    client.set_child_absent(child_id)
+
+    completed = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=3,
+        client=client,
+    )
+    assert completed["event"]["kind"] == "candidate_ready"
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert len(record.iterations) == 2
+    assert record.iterations[-1].hypothesis == (
+        "parent turn-boundary exact snapshot verification"
+    )
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["pending_responses"] == {}
+    assert job["settled_requests"]["request-verifier-1"]["response_ack_at"]
+    assert len(
+        [
+            message
+            for message in client.sent_messages
+            if message.get("wake") is False
+        ]
+    ) >= 2
+
+    continued = continue_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        candidate_id=task.candidate_id,
+        client=client,
+    )
+    assert continued["thinkthread_id"] == child_id
+    assert continued["fs_branch_id"] == job["fs_branch_id"]
+    continued_job = _load_job(runtime.root_dir, pool_id, continued["job_id"])
+    assert continued_job["agent_session_id"] == session.agent_session_id
+    assert continued_job["dispatch_index"] == 2
+    assert client._child(child_id)["executionState"] == "running"
+    client.set_child_absent(child_id)
+    continued_event = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=3,
+        client=client,
+    )
+    assert continued_event["event"]["kind"] == "candidate_ready"
+    assert continued_event["event"]["agent_session_id"] == session.agent_session_id
+
+    closed = close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        mode="drain",
+        client=client,
+    )
+    assert closed["state"] == "closed"
+    assert closed["active_count"] == 0
+    assert closed["free_slots"] == closed["max_parallel"]
+    assert closed["cleanup_observation"]["remaining_pool_children"] == []
+    assert client.children == []
+    assert all(branch["state"] == "removed" for branch in client.branch_states.values())
+
+
+def test_worker_rpc_response_chunks_are_numbered_and_hash_bound() -> None:
+    response = {"ok": True, "result": {"text": "x" * 70000}}
+    chunks = [json.loads(item) for item in _response_chunks("request-large", response)]
+    assert [item["chunk_index"] for item in chunks] == [0, 1, 2]
+    assert {item["chunk_count"] for item in chunks} == {3}
+    assert len({item["response_sha256"] for item in chunks}) == 1
+    decoded = b"".join(base64.b64decode(item["data_base64"]) for item in chunks)
+    assert json.loads(decoded) == response
+
+
+@pytest.mark.pi
+def test_worker_verifier_rpc_replay_after_evidence_crash_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [1.5]
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    task = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=1).plan_id,
+    )[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        final_verify=False,
+        client=client,
+    )
+    pool_id = opened["pool_id"]
+    job_id = opened["jobs"][0]["job_id"]
+    child_id = opened["jobs"][0]["thinkthread_id"]
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+    request = worker_request(
+        request_id="request-crash-replay",
+        agent_session_id=session.agent_session_id,
+        tool="search_run_verifier",
+        params={"hypothesis": "优化性能"},
+    )
+    client.enqueue(child_id, request)
+    wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert len(runtime._load_candidate_record(run_id, task.candidate_id).iterations) == 1
+    run_calls = len(client.run_params)
+
+    # Evidence is durable, but simulate losing job settlement and the cursor
+    # update before the controller process exits.
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    job["settled_requests"].pop("request-crash-replay")
+    job.get("pending_responses", {}).pop("request-crash-replay", None)
+    job["request_intents"]["request-crash-replay"]["state"] = (
+        "platform_mutation_started"
+    )
+    job["message_cursor"] = "1"
+    _write_job(runtime.root_dir, pool_id, job)
+
+    wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert len(record.iterations) == 1
+    assert record.iterations[0].rpc_request_id == "request-crash-replay"
+    assert len(client.run_params) == run_calls
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["settled_requests"]["request-crash-replay"]["response"]["ok"] is True
+
+
+@pytest.mark.pi
+@pytest.mark.parametrize("scores", [[1.5], [2.0, 1.0]])
+def test_verifier_rpc_replay_repairs_run_state_after_candidate_write_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scores: list[float],
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = list(scores)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    task = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=1).plan_id,
+    )[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    if len(scores) == 2:
+        runtime.run_verifier(
+            run_id,
+            task.candidate_id,
+            agent_session_id=session.agent_session_id,
+            hypothesis="establish incumbent",
+            idempotency_key="request-incumbent",
+        )
+
+    evidence_written = False
+    crashed = False
+    original_candidate_write = runtime._write_candidate_record
+    original_run_write = runtime._write_run
+
