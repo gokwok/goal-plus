@@ -5893,6 +5893,211 @@ class FileSearchRuntime:
                 )
         return blocking
 
+    def _pi_thinkthread_pool_cleanup_blockers(
+        self,
+        run_id: str,
+    ) -> list[dict[str, str]]:
+        pool_root = self.root_dir / "host-pools" / "pi"
+        if not pool_root.is_dir():
+            return []
+        blockers: list[dict[str, str]] = []
+        for path in sorted(pool_root.glob("*/pool.json")):
+            try:
+                pool = load_json(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if pool.get("host") != "pi-thinkthread" or pool.get("run_id") != run_id:
+                continue
+            state = str(pool.get("state") or "unknown")
+            if state != "closed":
+                blockers.append(
+                    {
+                        "pool_id": str(pool.get("pool_id") or path.parent.name),
+                        "state": state,
+                    }
+                )
+        return blockers
+
+    def _owned_pi_thinkthread_snapshots(self, run_id: str) -> list[str]:
+        """Return snapshots created by this run, newest first.
+
+        Artifact references are deliberately not scanned recursively: a successor
+        run may carry inherited Evidence that points at an artifact owned by a
+        different run. Creation intents and snapshot-patch results are the local
+        ownership ledger.
+        """
+
+        run = self._load_run(run_id)
+        snapshot_ids: list[str] = []
+
+        def add(snapshot_id: object) -> None:
+            if (
+                isinstance(snapshot_id, str)
+                and snapshot_id.startswith("fsnap-")
+                and snapshot_id not in snapshot_ids
+            ):
+                snapshot_ids.append(snapshot_id)
+
+        for intent in run.fs_snapshot_intents:
+            add(intent.snapshot_id)
+        for record in self._load_candidate_records(run_id):
+            for intent in record.fs_snapshot_intents:
+                add(intent.snapshot_id)
+        for request in run.fs_requests:
+            if request.operation in {"root_snapshot", "branch_snapshot"} and isinstance(
+                request.result, dict
+            ):
+                add(request.result.get("snapshotId"))
+                continue
+            if request.operation != "snapshot_patch" or not isinstance(
+                request.result, dict
+            ):
+                continue
+            snapshot = request.result.get("snapshot")
+            if isinstance(snapshot, dict):
+                add(snapshot.get("snapshotId"))
+
+        # Tool-copy settlement is persisted after the patch response and is a
+        # second ownership source if a legacy request record omitted its result.
+        for item in run.fs_cleanup:
+            if item.get("kind") == "tool_copy":
+                add(item.get("target_snapshot_id"))
+
+        # Delete descendants/attempts before the initial Root baseline. Current
+        # fs v1 snapshots are independent immutable trees, but this order also
+        # remains valid if the backend retains derivation pins in the future.
+        return list(reversed(snapshot_ids))
+
+    def _prepare_pi_thinkthread_snapshot_remove(
+        self,
+        run_id: str,
+        snapshot_id: str,
+    ) -> tuple[str, str]:
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            matching = [
+                item
+                for item in run.fs_cleanup
+                if item.get("kind") == "snapshot_remove"
+                and item.get("snapshot_id") == snapshot_id
+            ]
+            if matching:
+                record = matching[-1]
+                request_id = record.get("request_id")
+                if not isinstance(request_id, str):
+                    raise RuntimeError(
+                        f"snapshot cleanup record omitted request_id: {snapshot_id}"
+                    )
+                return request_id, str(record.get("state") or "prepared")
+
+            request_id = new_request_id()
+            now = utc_timestamp()
+            run.fs_requests.append(
+                FsRequestRecord(
+                    request_id=request_id,
+                    operation="snapshot_remove",
+                    context={"snapshot_id": snapshot_id},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            run.fs_cleanup.append(
+                {
+                    "kind": "snapshot_remove",
+                    "snapshot_id": snapshot_id,
+                    "request_id": request_id,
+                    "state": "prepared",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            self._write_run(run)
+            return request_id, "prepared"
+
+    def _update_pi_thinkthread_snapshot_cleanup(
+        self,
+        run_id: str,
+        snapshot_id: str,
+        *,
+        state: str,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            record = next(
+                (
+                    item
+                    for item in reversed(run.fs_cleanup)
+                    if item.get("kind") == "snapshot_remove"
+                    and item.get("snapshot_id") == snapshot_id
+                ),
+                None,
+            )
+            if record is None:
+                raise RuntimeError(
+                    f"snapshot cleanup intent is not persisted: {snapshot_id}"
+                )
+            record["state"] = state
+            record["updated_at"] = utc_timestamp()
+            if result is not None:
+                record["result"] = result
+            if error is not None:
+                record["error"] = error
+            elif state in {"removing", "removed", "already_absent"}:
+                record.pop("error", None)
+            if state in {"removed", "already_absent"}:
+                record["removed_at"] = utc_timestamp()
+                for intent in run.fs_snapshot_intents:
+                    if intent.snapshot_id == snapshot_id:
+                        intent.state = "cleaned"
+                        intent.updated_at = utc_timestamp()
+            self._write_run(run)
+
+        if state in {"removed", "already_absent"}:
+            for candidate in self._load_candidate_records(run_id):
+                changed = False
+                for intent in candidate.fs_snapshot_intents:
+                    if intent.snapshot_id == snapshot_id:
+                        intent.state = "cleaned"
+                        intent.updated_at = utc_timestamp()
+                        changed = True
+                if changed:
+                    self._write_candidate_record(run_id, candidate)
+
+    def _record_pi_thinkthread_storage_observation(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        storage: dict[str, Any] | None,
+        error: str | None = None,
+    ) -> None:
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            prior = next(
+                (
+                    item
+                    for item in reversed(run.fs_cleanup)
+                    if item.get("kind") == "storage_observation"
+                ),
+                None,
+            )
+            payload = {
+                "kind": "storage_observation",
+                "state": state,
+                "storage": storage,
+                "observed_at": utc_timestamp(),
+            }
+            if error:
+                payload["error"] = error
+            if prior is None:
+                run.fs_cleanup.append(payload)
+            else:
+                prior.clear()
+                prior.update(payload)
+            self._write_run(run)
+
     def report(self, run_id: str) -> Path:
         blocking = self._blocking_goal_report_records(run_id)
         if blocking:
