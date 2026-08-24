@@ -6957,6 +6957,278 @@ class FileSearchRuntime:
         )
         return request_id
 
+    def _promote_pi_thinkthread(
+        self,
+        run_id: str,
+        candidate_id: str,
+        frozen: FrozenSpec,
+    ) -> Path:
+        run = self._load_run(run_id)
+        if run.state not in {RunState.READY_TO_PROMOTE, RunState.NEEDS_RECOVERY}:
+            raise RuntimeError(
+                f"cannot publish pi-thinkthread run from state {run.state}"
+            )
+        baseline = self._fs_snapshot_ref(
+            run.baseline_artifact_ref,
+            field="publication baseline",
+        )
+        selected = self._fs_snapshot_ref(
+            run.selected_artifact_ref,
+            field="publication target",
+        )
+        record = self._load_candidate_record(run_id, candidate_id)
+        selected_iteration = next(
+            (
+                iteration
+                for iteration in record.iterations
+                if iteration.iteration == run.selected_iteration
+                and iteration.attempt_ref == selected
+                and self._fs_iteration_eligible(iteration)
+                and iteration.artifact_hash == run.selected_artifact_hash
+            ),
+            None,
+        )
+        if selected_iteration is None:
+            raise RuntimeError(
+                "cannot publish without exact passing selected FsSnapshot Evidence"
+            )
+        if record.touched_denied_files or record.changed_outside_allowed:
+            raise RuntimeError(
+                "cannot publish candidate that changed denied/out-of-surface files"
+            )
+
+        client = self._agent_posix_client()
+        client.preflight()
+        recovering_publication = False
+        existing_publication = run.publication
+        if existing_publication is not None:
+            if (
+                existing_publication.base_ref != baseline
+                or existing_publication.target_ref != selected
+            ):
+                raise RuntimeError(
+                    "existing publication intent targets a different artifact"
+                )
+            if existing_publication.state == "committed":
+                manifest_path = (
+                    self._run_dir(run_id)
+                    / "promotion"
+                    / f"{candidate_id}.publication.json"
+                )
+                if not manifest_path.exists() and existing_publication.manifest:
+                    write_json(manifest_path, existing_publication.manifest)
+                return manifest_path
+            evidence = record.promotion_evidence
+            if frozen.spec.promotion_verifiers and (
+                evidence is None
+                or evidence.selected_artifact_ref != selected
+                or evidence.artifact_ref != selected
+                or evidence.artifact_hash != run.selected_artifact_hash
+                or not evidence.passed
+            ):
+                raise RuntimeError(
+                    "publication recovery lost exact passing promotion Evidence"
+                )
+            selected_matches = self._publication_root_match(client, selected)
+            if selected_matches:
+                persisted = next(
+                    (
+                        item
+                        for item in run.fs_requests
+                        if item.request_id == existing_publication.request_id
+                    ),
+                    None,
+                )
+                outcome = persisted.result if persisted is not None else None
+                return self._commit_pi_thinkthread_publication(
+                    run_id=run_id,
+                    candidate_id=candidate_id,
+                    baseline=baseline,
+                    selected=selected,
+                    request_id=existing_publication.request_id,
+                    outcome=outcome,
+                    client=client,
+                )
+            if not self._publication_root_match(client, baseline):
+                with self._run_transaction(run_id):
+                    latest = self._load_run(run_id)
+                    assert latest.publication is not None
+                    latest.publication.state = "outcome_unknown"
+                    latest.publication.updated_at = utc_timestamp()
+                    latest.publication.manifest = {
+                        "status": "conflict",
+                        "request_id": existing_publication.request_id,
+                        "baseline_matches": False,
+                        "selected_matches": False,
+                        "recorded_at": utc_timestamp(),
+                    }
+                    latest.state = RunState.READY_TO_PROMOTE
+                    latest.budget_used["publication_conflict"] = True
+                    self._write_run(latest)
+                raise RuntimeError(
+                    "WorkspacePublicationConflict: Root matches neither the "
+                    "selected snapshot nor a safely retryable baseline"
+                )
+            recovering_publication = True
+
+        if frozen.spec.promotion_verifiers and not recovering_publication:
+            promotion_report = self.run_verifier(
+                run_id,
+                candidate_id,
+                scope="promotion",
+            )
+            record = self._load_candidate_record(run_id, candidate_id)
+            evidence = record.promotion_evidence
+            if (
+                not promotion_report.promotion_passed
+                or evidence is None
+                or evidence.selected_artifact_ref != selected
+                or evidence.artifact_ref != selected
+                or evidence.artifact_hash != run.selected_artifact_hash
+                or not evidence.passed
+            ):
+                raise RuntimeError(
+                    "cannot publish without fresh exact passing promotion Evidence"
+                )
+
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            if run.publication is None:
+                request_id = new_request_id()
+                now = utc_timestamp()
+                run.publication = PublicationIntent(
+                    base_ref=baseline,
+                    target_ref=selected,
+                    request_id=request_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                run.fs_requests.append(
+                    FsRequestRecord(
+                        request_id=request_id,
+                        operation="replace",
+                        context={
+                            "candidate_id": candidate_id,
+                            "base_snapshot_id": baseline.snapshot_id,
+                            "target_snapshot_id": selected.snapshot_id,
+                        },
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                self._write_run(run)
+            else:
+                if (
+                    run.publication.base_ref != baseline
+                    or run.publication.target_ref != selected
+                ):
+                    raise RuntimeError(
+                        "existing publication intent targets a different artifact"
+                    )
+                request_id = run.publication.request_id
+                if run.publication.state == "committed":
+                    manifest_path = (
+                        self._run_dir(run_id)
+                        / "promotion"
+                        / f"{candidate_id}.publication.json"
+                    )
+                    if not manifest_path.exists() and run.publication.manifest:
+                        write_json(manifest_path, run.publication.manifest)
+                    return manifest_path
+
+        outcome: dict[str, Any] | None
+        try:
+            outcome = self._invoke_publication_replace(
+                client=client,
+                run_id=run_id,
+                request_id=request_id,
+                base=baseline,
+                target=selected,
+            )
+        except (AgentPosixBridgeError, RuntimeError) as exc:
+            with self._run_transaction(run_id):
+                latest = self._load_run(run_id)
+                assert latest.publication is not None
+                latest.publication.state = "outcome_unknown"
+                latest.publication.updated_at = utc_timestamp()
+                latest.state = RunState.NEEDS_RECOVERY
+                latest.budget_used["needs_recovery_reason"] = (
+                    f"publication request {request_id} requires reconciliation: {exc}"
+                )
+                self._write_run(latest)
+            outcome = None
+
+        selected_matches = self._publication_root_match(client, selected)
+        baseline_matches = (
+            False
+            if selected_matches
+            else self._publication_root_match(client, baseline)
+        )
+        if not selected_matches and baseline_matches:
+            if outcome is None:
+                latest = self._load_run(run_id)
+                persisted = next(
+                    (
+                        item
+                        for item in latest.fs_requests
+                        if item.request_id == request_id
+                    ),
+                    None,
+                )
+                if persisted is not None and persisted.state == "failed":
+                    request_id = self._rotate_failed_publication_request(
+                        run_id=run_id,
+                        candidate_id=candidate_id,
+                        failed_request_id=request_id,
+                        base=baseline,
+                        target=selected,
+                        client=client,
+                    )
+                # Root is provably still at the expected base. Reuse an
+                # outcome-unknown request, but allocate a successor only after
+                # a confirmed terminal failed attempt has been durably recorded.
+                try:
+                    outcome = self._invoke_publication_replace(
+                        client=client,
+                        run_id=run_id,
+                        request_id=request_id,
+                        base=baseline,
+                        target=selected,
+                    )
+                except (AgentPosixBridgeError, RuntimeError):
+                    outcome = None
+                selected_matches = self._publication_root_match(client, selected)
+        if not selected_matches:
+            with self._run_transaction(run_id):
+                latest = self._load_run(run_id)
+                assert latest.publication is not None
+                latest.publication.state = "outcome_unknown"
+                latest.publication.updated_at = utc_timestamp()
+                latest.publication.manifest = {
+                    "status": "conflict",
+                    "request_id": request_id,
+                    "baseline_matches": baseline_matches,
+                    "selected_matches": selected_matches,
+                    "recorded_at": utc_timestamp(),
+                }
+                latest.state = RunState.READY_TO_PROMOTE
+                latest.budget_used["publication_conflict"] = True
+                self._write_run(latest)
+            raise RuntimeError(
+                "WorkspacePublicationConflict: Root matches neither the selected "
+                "snapshot nor a safely retryable baseline"
+            )
+
+        return self._commit_pi_thinkthread_publication(
+            run_id=run_id,
+            candidate_id=candidate_id,
+            baseline=baseline,
+            selected=selected,
+            request_id=request_id,
+            outcome=outcome,
+            client=client,
+        )
+
     def _strategy_mode(self, strategy: StrategySpec) -> str:
         return strategy.name.strip().lower().replace("-", "_")
 
