@@ -3018,3 +3018,226 @@ def test_pool_close_escalates_typed_wait_timeout_before_cleanup(
     assert closed["cleanup_observation"]["remaining_pool_children"] == []
 
 
+def test_wait_any_rejects_negative_timeout() -> None:
+    with pytest.raises(ValueError, match="timeout_seconds must be non-negative"):
+        wait_any(root_dir="/unused", pool_id="pool_unused", timeout_seconds=-1)
+
+
+@pytest.mark.pi
+def test_discard_restores_best_snapshot_then_wakes_same_retained_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [1.5, 1.0, 2.0]
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    snapshot = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    pool_id = snapshot["pool_id"]
+    job_id = snapshot["jobs"][0]["job_id"]
+    child_id = snapshot["jobs"][0]["thinkthread_id"]
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+    for index, hypothesis in enumerate(("first best", "regression"), start=1):
+        client.enqueue(
+            child_id,
+            worker_request(
+                request_id=f"request-verifier-{index}",
+                agent_session_id=session.agent_session_id,
+                tool="search_run_verifier",
+                params={"hypothesis": hypothesis},
+            ),
+        )
+    wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert [item.disposition for item in record.iterations] == ["keep", "discard"]
+    assert record.iterations[1].settled_ref == FsSnapshotArtifactRef(
+        snapshot_id="fsnap-attempt-1"
+    )
+
+    child = client._child(child_id)
+    child.update(
+        {
+            "agentState": "ready",
+            "executionState": "running",
+            "pendingWake": False,
+            "lastWakeOutcome": {
+                "messageId": job["active_message_id"],
+                "outcome": "completed",
+                "finishedAtUnixMs": 1,
+            },
+        }
+    )
+    boundary = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert boundary["event"] is None
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["status"] == "running"
+    assert job["boundary_wake_count"] == 1
+    assert job["turn_boundary_wakes"][-1]["reasons"] == ["verifier_restore"]
+    assert job.get("turn_boundary_wake_required") is None
+    assert client._child(child_id)["executionState"] == "running"
+    branch = client.branch_states[job["fs_branch_id"]]
+    assert branch["baseSnapshotId"] == "fsnap-attempt-1"
+    branch_operations = [
+        operation
+        for operation, _params in client.operations
+        if operation
+        in {"thinkthread.signal", "thinkthread.wait", "fs.branch.reset"}
+    ]
+    assert branch_operations[-3:] == [
+        "thinkthread.signal",
+        "thinkthread.wait",
+        "fs.branch.reset",
+    ]
+    assert job["branch_mutation_execution_stop"]["state"] == "execution_absent"
+    run = runtime._load_run(run_id)
+    restore = [
+        item
+        for item in run.fs_cleanup
+        if item.get("kind") == "branch_restore"
+    ][-1]
+    assert restore["state"] == "restored"
+
+    client.set_child_absent(child_id)
+    completed = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=3,
+        client=client,
+    )
+    assert completed["event"]["kind"] == "candidate_ready"
+    assert completed["event"]["result"]["handle"]["external_id"] == child_id
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert record.iterations[-1].score == 2.0
+    assert record.iterations[-1].disposition == "keep"
+
+
+@pytest.mark.pi
+def test_blocked_branch_reset_retries_only_after_execution_is_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [1.5, 1.0]
+    client.reset_blocked_once = True
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    pool_id = opened["pool_id"]
+    job_id = opened["jobs"][0]["job_id"]
+    child_id = opened["jobs"][0]["thinkthread_id"]
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+    for index, hypothesis in enumerate(("best", "regression"), start=1):
+        client.enqueue(
+            child_id,
+            worker_request(
+                request_id=f"request-reset-recovery-{index}",
+                agent_session_id=session.agent_session_id,
+                tool="search_run_verifier",
+                params={"hypothesis": hypothesis},
+            ),
+        )
+    wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    child = client._child(child_id)
+    child.update(
+        {
+            "agentState": "ready",
+            "executionState": "running",
+            "pendingWake": False,
+            "lastWakeOutcome": {
+                "messageId": job["active_message_id"],
+                "outcome": "completed",
+                "finishedAtUnixMs": 1,
+            },
+        }
+    )
+
+    first = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert first["event"] is None
+    failed_reset = _load_job(runtime.root_dir, pool_id, job_id)
+    assert failed_reset["status"] == "needs_recovery"
+    assert failed_reset["error"]["stage"] == "restore"
+    assert client._child(child_id)["executionState"] == "absent"
+
+    recovered = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert recovered["event"] is None
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["status"] == "running"
+    assert job["restore_required"]["state"] == "restored"
+    assert job["restore_recovery_resumed_at"]
+    assert client._child(child_id)["executionState"] == "running"
+
+
+@pytest.mark.pi
