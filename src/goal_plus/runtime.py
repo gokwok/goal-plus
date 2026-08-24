@@ -1416,7 +1416,8 @@ class FileSearchRuntime:
             key=lambda record: record.candidate_id,
         )
         for record in plan_records:
-            self._ensure_results_tsv(record, frozen.spec.metric_name)
+            if frozen.spec.strategy.worker_host != "pi-thinkthread":
+                self._ensure_results_tsv(record, frozen.spec.metric_name)
             self._write_candidate_record(run_id, record)
         if all_records:
             highest_index = max(
@@ -1493,7 +1494,12 @@ class FileSearchRuntime:
                 task=task,
                 results_ledger=self._inherited_results_ledger(run, task),
             )
-            self._ensure_results_tsv(record, frozen.spec.metric_name)
+            if frozen.spec.strategy.worker_host != "pi-thinkthread":
+                self._ensure_results_tsv(record, frozen.spec.metric_name)
+                if record.results_ledger_git_head is not None:
+                    record.settled_artifact_ref = GitCommitArtifactRef(
+                        commit=record.results_ledger_git_head
+                    )
             self._write_candidate_record(run_id, record)
             tasks.append(task)
             run.next_candidate_index += 1
@@ -1664,7 +1670,7 @@ class FileSearchRuntime:
                 worker_budget_override=worker_budget_override,
             )
             host = frozen.spec.strategy.worker_host
-            if host == "pi-rpc":
+            if host in {"pi-rpc", "pi-thinkthread"}:
                 launch["run_id"] = run_id
             host_handle = AgentHostHandle(host=host)
             if host == "codex":
@@ -1676,6 +1682,15 @@ class FileSearchRuntime:
                     update={
                         "external_id": launch.get("session_id", agent_session_id),
                         "metadata": {"continuation": "native_session"},
+                    }
+                )
+            elif host == "pi-thinkthread":
+                host_handle = host_handle.model_copy(
+                    update={
+                        "metadata": {
+                            "continuation": "retained_child_session",
+                            "fs_base_snapshot_id": candidate_record.task.fs_base_snapshot_id,
+                        },
                     }
                 )
             session = AgentSessionRecord(
@@ -1754,7 +1769,12 @@ class FileSearchRuntime:
                     "source": "bound_metadata",
                 }
 
-        model_handoff, handoff_error = self._workspace_model_handoff(session.workspace)
+        model_handoff: dict[str, Any] | None = None
+        handoff_error: str | None = None
+        if session.workspace is not None:
+            model_handoff, handoff_error = self._workspace_model_handoff(
+                session.workspace
+            )
         if model_handoff is not None:
             progress_payload = dict(progress) if isinstance(progress, dict) else {}
             progress_payload.update(
@@ -1913,14 +1933,42 @@ class FileSearchRuntime:
                     ),
                 }
             )
-        results_were_initialized = candidate_record.results_ledger_git_head is not None
-        results_tsv = self._ensure_results_tsv(
-            candidate_record,
-            frozen.spec.metric_name,
-        )
-        if not results_were_initialized:
-            self._write_candidate_record(session.run_id, candidate_record)
-        workspace_status = self._git_status(candidate_record.task.workspace)
+        is_thinkthread = frozen.spec.strategy.worker_host == "pi-thinkthread"
+        results_tsv: Path | None = None
+        if not is_thinkthread:
+            results_were_initialized = (
+                candidate_record.results_ledger_git_head is not None
+            )
+            results_tsv = self._ensure_results_tsv(
+                candidate_record,
+                frozen.spec.metric_name,
+            )
+            if not results_were_initialized:
+                self._write_candidate_record(session.run_id, candidate_record)
+            workspace_status = self._git_status(candidate_record.task.workspace)
+            workspace_resume = {
+                "git_head": self._git_head(candidate_record.task.workspace),
+                "git_status": workspace_status,
+                "dirty": bool(workspace_status),
+                "changed_files": self._detect_changed_files(
+                    Path(run.source_path), candidate_record.task.workspace
+                ),
+            }
+        else:
+            workspace_resume = {
+                "fs_branch_id": candidate_record.task.fs_branch_id,
+                "baseline_artifact_ref": (
+                    run.baseline_artifact_ref.model_dump(mode="json")
+                    if run.baseline_artifact_ref is not None
+                    else None
+                ),
+                "settled_artifact_ref": (
+                    candidate_record.settled_artifact_ref.model_dump(mode="json")
+                    if candidate_record.settled_artifact_ref is not None
+                    else None
+                ),
+                "changed_files": list(candidate_record.detected_changed_files),
+            }
         dispatch_count = session.host_handle.metadata.get("dispatch_count")
         dispatch_count = dispatch_count if isinstance(dispatch_count, int) else 0
         continuation_mode = session.launch.get("continuation")
@@ -1940,13 +1988,13 @@ class FileSearchRuntime:
             "host": session.host,
             "host_handle": session.host_handle.model_dump(mode="json"),
             "directive": session.directive,
-            "workspace": str(session.workspace),
+            "workspace": "." if is_thinkthread else str(session.workspace),
             "objective": frozen.spec.objective,
             "metric_name": frozen.spec.metric_name,
             "metric_direction": frozen.spec.metric_direction,
             "run_budget": frozen.spec.budget.model_dump(mode="json"),
             "candidate_task": candidate_record.task.model_dump(mode="json"),
-            "results_tsv": str(results_tsv),
+            "results_tsv": None if results_tsv is None else str(results_tsv),
             "results": [
                 entry.model_dump(mode="json")
                 for entry in candidate_record.results_ledger
@@ -1958,14 +2006,7 @@ class FileSearchRuntime:
                 "dispatch_count": dispatch_count,
                 "previous_sessions": previous_sessions,
                 "latest_handoff": latest_handoff,
-                "workspace": {
-                    "git_head": self._git_head(candidate_record.task.workspace),
-                    "git_status": workspace_status,
-                    "dirty": bool(workspace_status),
-                    "changed_files": self._detect_changed_files(
-                        Path(run.source_path), candidate_record.task.workspace
-                    ),
-                },
+                "workspace": workspace_resume,
             },
             "iterations": self.list_iterations(session.run_id, session.candidate_id),
         }
@@ -1993,7 +2034,12 @@ class FileSearchRuntime:
                 GlobalEvidenceViewReference(
                     candidate_id=str(entry["candidate_id"]),
                     iteration=int(entry["iteration"]),
-                    commit=str(entry["commit"]),
+                    artifact_ref=entry.get("artifact_ref"),
+                    commit=(
+                        str(entry["commit"])
+                        if entry.get("commit") is not None
+                        else None
+                    ),
                     view_created_at=str(entry["view_created_at"]),
                     supplemental_evaluation_present=(
                         bool(entry.get("supplemental_available"))
@@ -2001,7 +2047,10 @@ class FileSearchRuntime:
                 )
                 for entry in view
                 if entry["view"] is not None
-                and entry["commit"] is not None
+                and (
+                    entry.get("artifact_ref") is not None
+                    or entry.get("commit") is not None
+                )
                 and entry["view_created_at"] is not None
             ]
             read_record = GlobalEvidenceReadRecord(
@@ -2071,6 +2120,12 @@ class FileSearchRuntime:
             or task.candidate_id != candidate_id
             or task.iteration != iteration
             or task.attempt_commit != entry["commit"]
+            or (
+                task.attempt_ref.model_dump(mode="json")
+                if task.attempt_ref is not None
+                else None
+            )
+            != entry.get("artifact_ref")
         ):
             raise RuntimeError("supplemental Evidence identity does not match iteration")
         if view.supplemental_evaluation is None:
@@ -2079,6 +2134,7 @@ class FileSearchRuntime:
         return {
             "candidate_id": candidate_id,
             "iteration": iteration,
+            "artifact_ref": entry.get("artifact_ref"),
             "commit": entry["commit"],
             "supplemental_evaluation": view.supplemental_evaluation.model_dump(
                 mode="json"
@@ -2108,6 +2164,7 @@ class FileSearchRuntime:
         summary: str,
         entrypoint: str,
         candidate_relative_source_paths: list[str],
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         session = self._load_agent_session_by_id(agent_session_id)
         lock_path = self._candidate_dir(session.run_id, session.candidate_id) / "verifier.lock"
@@ -2122,6 +2179,19 @@ class FileSearchRuntime:
                 if record.status not in {"created", "evaluated"}:
                     raise RuntimeError(
                         f"cannot stage a tool for candidate in status {record.status}"
+                    )
+                if frozen.spec.strategy.worker_host == "pi-thinkthread":
+                    return self._stage_pi_thinkthread_shared_tool(
+                        run=run,
+                        frozen=frozen,
+                        record=record,
+                        name=name,
+                        summary=summary,
+                        entrypoint=entrypoint,
+                        candidate_relative_source_paths=(
+                            candidate_relative_source_paths
+                        ),
+                        idempotency_key=idempotency_key,
                     )
                 if record.task.share_out_dir is None:
                     raise RuntimeError("shared-dir candidate has no share-out directory")
