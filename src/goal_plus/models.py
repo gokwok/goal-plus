@@ -1319,17 +1319,117 @@ class RunSummary(SearchModel):
 
 
 class BestArtifactRecord(SearchModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     run_id: str
     candidate_id: str
     iteration: int = Field(ge=1)
-    commit: str = Field(min_length=1)
+    artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    commit: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     score: float
     metric_name: str = Field(min_length=1)
     metric_direction: Literal["minimize", "maximize"]
     artifact_hash: str = Field(min_length=1)
-    workspace: str = Field(min_length=1)
+    workspace: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     changed_files: list[str] = Field(default_factory=list)
+    updated_at: str
+
+    @model_validator(mode="after")
+    def require_artifact(self) -> "BestArtifactRecord":
+        if self.artifact_ref is None and self.commit is None:
+            raise ValueError("best artifact record requires artifact_ref or commit")
+        return self
+
+
+class FsRequestRecord(SearchModel):
+    request_id: str = Field(pattern=r"^req-[A-Za-z0-9][A-Za-z0-9_-]*$")
+    operation: Literal[
+        "run",
+        "apply",
+        "replace",
+        "root_snapshot",
+        "branch_snapshot",
+        "snapshot_patch",
+        "snapshot_remove",
+    ]
+    state: Literal[
+        "prepared",
+        "accepted",
+        "running",
+        "needs_recovery",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "closed",
+    ] = "prepared"
+    context: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    error: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    created_at: str
+    updated_at: str
+    closed_at: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class FsSnapshotCreationIntent(SearchModel):
+    intent_id: str = Field(min_length=1)
+    operation: Literal["root_snapshot", "branch_snapshot"]
+    request_id: str | None = Field(
+        default=None,
+        pattern=r"^req-[A-Za-z0-9][A-Za-z0-9_-]*$",
+        exclude_if=lambda value: value is None,
+    )
+    branch_id: str | None = Field(
+        default=None,
+        pattern=r"^fsbranch-[A-Za-z0-9][A-Za-z0-9_-]*$",
+        exclude_if=lambda value: value is None,
+    )
+    state: Literal[
+        "prepared",
+        "platform_mutation_started",
+        "created",
+        "failed",
+        "needs_recovery",
+        "cleaned",
+    ] = "prepared"
+    snapshot_id: str | None = Field(
+        default=None,
+        pattern=r"^fsnap-[A-Za-z0-9][A-Za-z0-9_-]*$",
+        exclude_if=lambda value: value is None,
+    )
+    purpose: str = Field(min_length=1)
+    created_at: str
+    updated_at: str
+
+
+class PublicationIntent(SearchModel):
+    state: Literal["prepared", "outcome_unknown", "committed"] = "prepared"
+    base_ref: FsSnapshotArtifactRef
+    target_ref: FsSnapshotArtifactRef
+    request_id: str = Field(pattern=r"^req-[A-Za-z0-9][A-Za-z0-9_-]*$")
+    manifest: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    created_at: str
     updated_at: str
 
 
@@ -1338,6 +1438,10 @@ class RunRecord(SearchModel):
     state: RunState
     frozen_spec_id: str
     source_path: str
+    fs_source_relative_path: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     created_at: str
     next_candidate_index: int = 1
     next_plan_index: int = 1
@@ -1349,8 +1453,32 @@ class RunRecord(SearchModel):
     selected_candidate_id: str | None = None
     selected_score: float | None = None
     selected_iteration: int | None = None
+    baseline_artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    selected_artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     selected_git_head: str | None = None
     selected_artifact_hash: str | None = None
+    publication: PublicationIntent | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    fs_requests: list[FsRequestRecord] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    fs_snapshot_intents: list[FsSnapshotCreationIntent] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    fs_cleanup: list[dict[str, Any]] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
     budget_used: dict[str, Any] = Field(default_factory=dict)
     source_run_id: str | None = None
     inherited_research: dict[str, Any] = Field(default_factory=dict)
@@ -1376,9 +1504,21 @@ class CandidateRecord(SearchModel):
     promotion_report: ScoreReport | None = None
     promotion_evidence: PromotionEvidence | None = None
     pending_tool_copies: list[ToolCopyReceipt] = Field(default_factory=list, exclude_if=lambda value: not value)
+    pending_fs_tool_stages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
     iterations: list[IterationRecord] = Field(default_factory=list)
     results_ledger: list[ResultLedgerEntry] = Field(default_factory=list)
     results_ledger_git_head: str | None = None
+    settled_artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    fs_snapshot_intents: list[FsSnapshotCreationIntent] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
 
 
 class AgentSessionRecord(SearchModel):
@@ -1395,9 +1535,15 @@ class AgentSessionRecord(SearchModel):
         exclude_if=lambda value: value is None,
     )
     model_provenance: dict[str, Any] = Field(default_factory=dict)
-    workspace: Path
+    workspace: Path | None = None
     launch: dict[str, Any] = Field(default_factory=dict)
     counters: dict[str, int] = Field(default_factory=dict)
     global_evidence_reads: list[GlobalEvidenceReadRecord] = Field(
         default_factory=list
     )
+
+    @model_validator(mode="after")
+    def require_workspace_for_git_hosts(self) -> "AgentSessionRecord":
+        if self.host != "pi-thinkthread" and self.workspace is None:
+            raise ValueError("non-ThinkThread AgentSessionRecord requires workspace")
+        return self

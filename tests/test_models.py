@@ -14,6 +14,7 @@ from goal_plus.models import (
     CandidateTask,
     EditSurface,
     GoalPlusSpecDraft,
+    FsSnapshotArtifactRef,
     IterationRecord,
     SearchPlan,
     SearchSpec,
@@ -199,6 +200,36 @@ def test_search_spec_parses_nested_models_and_serializes_enums() -> None:
     assert dumped["strategy"]["orchestration_mode"] == "parallel_loops"
     assert dumped["strategy"]["worker_host"] == "codex"
     assert "models" not in dumped["strategy"]
+
+
+@pytest.mark.pi
+def test_pi_thinkthread_spec_omits_workspace_and_rejects_selector() -> None:
+    data = valid_spec_dict()
+    data["strategy"] = {
+        "worker_host": "pi-thinkthread",
+        "worker_budget": {"max_runtime_seconds": 300},
+    }
+
+    spec = SearchSpec.model_validate(data)
+
+    assert spec.workspace is None
+    assert "workspace" not in spec.model_dump(mode="json")
+
+    data["workspace"] = {"backend": "git_worktree"}
+    with pytest.raises(ValidationError, match="must omit workspace"):
+        SearchSpec.model_validate(data)
+
+
+def test_fs_snapshot_artifact_ref_is_strict_and_discriminated() -> None:
+    reference = FsSnapshotArtifactRef(snapshot_id="fsnap-1234")
+
+    assert reference.model_dump(mode="json") == {
+        "kind": "fs_snapshot",
+        "snapshot_id": "fsnap-1234",
+    }
+
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        FsSnapshotArtifactRef(snapshot_id="wrev-old-api")
 
 
 def test_required_supplemental_evaluation_rejects_disabled_mode(
