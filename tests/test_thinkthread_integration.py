@@ -3241,3 +3241,230 @@ def test_blocked_branch_reset_retries_only_after_execution_is_absent(
 
 
 @pytest.mark.pi
+def test_checkpoint_success_with_lost_execution_records_and_recovers_continuation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [1.5, 2.0]
+    client.drop_execution_on_snapshot = True
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    snapshot = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    pool_id = snapshot["pool_id"]
+    job_id = snapshot["jobs"][0]["job_id"]
+    child_id = snapshot["jobs"][0]["thinkthread_id"]
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+    client.enqueue(
+        child_id,
+        worker_request(
+            request_id="request-checkpoint-resume",
+            agent_session_id=session.agent_session_id,
+            tool="search_run_verifier",
+            params={"hypothesis": "checkpoint while child exits"},
+        ),
+    )
+
+    result = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert result["event"] is None
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert record.iterations[0].metrics["thinkthread_continuation_required"] is True
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["checkpoint_continuation"]["state"] == "resumed"
+    assert job["checkpoint_continuation"]["snapshot_id"] == "fsnap-attempt-1"
+    assert job["boundary_wake_count"] == 1
+    assert client._child(child_id)["executionState"] == "running"
+
+    client.set_child_absent(child_id)
+    completed = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=3,
+        client=client,
+    )
+    assert completed["event"]["kind"] == "candidate_ready"
+
+
+@pytest.mark.pi
+def test_shared_tool_copy_patches_snapshot_resets_branch_and_wakes_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=2)
+    first, second = runtime.start_batch(run_id, plan.plan_id)
+    first_session = runtime.start_agent_session(run_id, first.candidate_id)
+    second_session = runtime.start_agent_session(run_id, second.candidate_id)
+    snapshot = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[first.candidate_id, second.candidate_id],
+        client=client,
+    )
+    by_candidate = {job["candidate_id"]: job for job in snapshot["jobs"]}
+    second_job = by_candidate[second.candidate_id]
+    second_child = second_job["thinkthread_id"]
+    second_job_id = second_job["job_id"]
+
+    runtime.stage_shared_tool(
+        first_session.agent_session_id,
+        name="probe",
+        summary="Reusable deterministic probe",
+        entrypoint="probe.py:probe",
+        candidate_relative_source_paths=[".tmp/tool-drafts/probe.py"],
+    )
+    runtime.run_verifier(
+        run_id,
+        first.candidate_id,
+        agent_session_id=first_session.agent_session_id,
+        hypothesis="publish shared probe",
+        toolization_decision={
+            "outcome": "staged",
+            "signals": ["domain_probe"],
+            "rationale": "The other candidate can reuse this probe.",
+            "tool_names": ["probe"],
+        },
+    )
+    published = runtime._load_candidate_record(run_id, first.candidate_id).iterations[
+        0
+    ].shared_tools[0]
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_tool_view_is_published",
+        lambda _runtime, _run_id, _tool: True,
+    )
+    job = _load_job(runtime.root_dir, snapshot["pool_id"], second_job_id)
+    client.enqueue(
+        second_child,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+    client.enqueue(
+        second_child,
+        worker_request(
+            request_id="request-copy-tool",
+            agent_session_id=second_session.agent_session_id,
+            tool="search_copy_shared_tool",
+            params={
+                "tool_id": published.tool_id,
+                "snapshot_hash": published.snapshot_hash,
+            },
+        ),
+    )
+    wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=snapshot["pool_id"],
+        timeout_seconds=0,
+        client=client,
+    )
+    client.set_child_absent(second_child)
+    client.reset_blocked_once = True
+    boundary = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=snapshot["pool_id"],
+        timeout_seconds=0,
+        client=client,
+    )
+    assert boundary["event"] is None
+    interrupted_copy = _load_job(
+        runtime.root_dir, snapshot["pool_id"], second_job_id
+    )
+    assert interrupted_copy["status"] == "needs_recovery"
+    assert interrupted_copy["error"]["stage"] == "restore"
+
+    boundary = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=snapshot["pool_id"],
+        timeout_seconds=0,
+        client=client,
+    )
+    assert boundary["event"] is None
+    job = _load_job(runtime.root_dir, snapshot["pool_id"], second_job_id)
+    assert job.get("error") is None, job.get("error")
+    assert job["settled_requests"]["request-copy-tool"]["response"].get(
+        "error"
+    ) is None, job["settled_requests"]["request-copy-tool"]["response"]
+    assert "copy_requirements" in job, {
+        key: job.get(key)
+        for key in (
+            "status",
+            "message_cursor",
+            "registered_at",
+            "settled_requests",
+            "message_errors",
+            "final_verifier",
+        )
+    }
+    assert job["copy_requirements"][0]["state"] == "applied"
+    target_snapshot_id = job["copy_requirements"][0]["target_snapshot_id"]
+    assert target_snapshot_id.startswith("fsnap-patched-")
+    assert client.branch_states[job["fs_branch_id"]]["baseSnapshotId"] == (
+        target_snapshot_id
+    )
+    assert job["turn_boundary_wakes"][-1]["reasons"] == ["shared_tool_copy"]
+    assert client._child(second_child)["executionState"] == "running"
+    record = runtime._load_candidate_record(run_id, second.candidate_id)
+    assert record.pending_tool_copies[0].target_snapshot_id == target_snapshot_id
+    assert record.settled_artifact_ref == FsSnapshotArtifactRef(
+        snapshot_id=target_snapshot_id
+    )
+    patch_requests = [
+        item
+        for item in runtime._load_run(run_id).fs_requests
+        if item.operation == "snapshot_patch"
+    ]
+    assert len(patch_requests) == 1
+    assert patch_requests[0].state == "closed"
+
+    close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=snapshot["pool_id"],
+        mode="interrupt",
+        client=client,
+    )
+
+
+@pytest.mark.pi
+def test_worker_rpc_rejects_message_sender_outside_bound_child(
