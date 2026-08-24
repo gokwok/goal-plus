@@ -852,6 +852,255 @@ async function runJsonCli(pi: ExtensionAPI, ctx: CommandRuntimeContext, tool: st
 	};
 }
 
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (isRecord(value)) {
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+			.join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+function sha256(value: string | Uint8Array): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+async function workerAgentPosixClient(): Promise<any> {
+	if (!workerSdkModulePromise) {
+		const configured = process.env.GOAL_PLUS_AGENT_POSIX_SDK_ENTRY;
+		if (!configured) {
+			throw new Error("GOAL_PLUS_AGENT_POSIX_SDK_ENTRY is required in the worker Profile");
+		}
+		workerSdkModulePromise = import(
+			configured.startsWith("file:") ? configured : pathToFileURL(configured).href
+		);
+	}
+	const sdk = await workerSdkModulePromise;
+	if (
+		sdk.CONTROL_PROTOCOL_VERSION !== AGENT_POSIX_CONTROL_PROTOCOL_VERSION ||
+		sdk.CONTRACT_FINGERPRINT !== AGENT_POSIX_CONTRACT_FINGERPRINT
+	) {
+		throw new Error(
+			`unsupported ThinkThread Agent POSIX SDK contract: protocol=${String(sdk.CONTROL_PROTOCOL_VERSION)}, fingerprint=${String(sdk.CONTRACT_FINGERPRINT)}`,
+		);
+	}
+	if (!workerSdkClientPromise) {
+		workerSdkClientPromise = Promise.resolve(sdk.AgentPosixClient.fromEnv());
+	}
+	return workerSdkClientPromise;
+}
+
+function registrationNonce(ctx: ExtensionContext): string | undefined {
+	const serialized = JSON.stringify(ctx.sessionManager.getEntries());
+	return /registration_nonce=([0-9a-f-]{36})/i.exec(serialized)?.[1];
+}
+
+async function ensureWorkerRegistration(client: any, parentId: string, ctx: ExtensionContext) {
+	if (workerRegistrationSent) return;
+	const nonce = registrationNonce(ctx);
+	if (!nonce) throw new Error("ThinkThread worker registration nonce is missing from the initial Message");
+	await client.invoke("message.send", {
+		recipientThinkthreadId: parentId,
+		text: JSON.stringify({
+			protocol: "goal-plus.pi-thinkthread.v2",
+			type: "registration",
+			registration_nonce: nonce,
+		}),
+		wake: false,
+	});
+	workerRegistrationSent = true;
+}
+
+function latestDispatchNonce(ctx: ExtensionContext): string | undefined {
+	const serialized = JSON.stringify(ctx.sessionManager.getEntries());
+	const matches = [...serialized.matchAll(/dispatch_nonce=([0-9a-f-]{36})/gi)];
+	return matches.at(-1)?.[1];
+}
+
+async function acknowledgeWorkerDispatch(ctx: ExtensionContext): Promise<void> {
+	const dispatchNonce = latestDispatchNonce(ctx);
+	if (!dispatchNonce || workerAcknowledgedDispatches.has(dispatchNonce)) return;
+	const client = await workerAgentPosixClient();
+	const self = await client.invoke("self", {});
+	const parentId = self.parentThinkthreadId;
+	if (typeof parentId !== "string") {
+		throw new Error("Goal Plus worker dispatch acknowledgement requires a ThinkThread Child");
+	}
+	await ensureWorkerRegistration(client, parentId, ctx);
+	await client.invoke("message.send", {
+		recipientThinkthreadId: parentId,
+		text: JSON.stringify({
+			protocol: "goal-plus.pi-thinkthread.v2",
+			type: "dispatch_ack",
+			dispatch_nonce: dispatchNonce,
+		}),
+		wake: false,
+	});
+	workerAcknowledgedDispatches.add(dispatchNonce);
+}
+
+async function validateThinkThreadRole(ctx: ExtensionContext): Promise<void> {
+	const configured = process.env.GOAL_PLUS_AGENT_POSIX_SDK_ENTRY;
+	const environmentParentId = process.env.THINKTHREAD_PARENT_ID;
+	if (!configured) return;
+	// Root session_start can run before the Agent POSIX transport is ready.  Root
+	// tools perform their own SDK preflight when first used; only a Child needs
+	// synchronous role validation and registration before it can act.
+	if (role !== "worker") {
+		if (environmentParentId) {
+			throw new Error("Goal Plus Root role cannot run inside a ThinkThread Child");
+		}
+		return;
+	}
+	const client = await workerAgentPosixClient();
+	const self = await client.invoke("self", {});
+	const parentId = typeof self.parentThinkthreadId === "string" ? self.parentThinkthreadId : undefined;
+	if (!parentId || !environmentParentId || parentId !== environmentParentId) {
+		throw new Error("Goal Plus worker role does not match the authenticated ThinkThread Child");
+	}
+	const capabilities = Array.isArray(self.capabilities)
+		? self.capabilities
+			.filter((item: unknown) => isRecord(item) && typeof item.id === "string")
+			.map((item: { id: string }) => item.id)
+			.sort()
+		: [];
+	if (capabilities.length !== 1 || capabilities[0] !== "thinkthread.message") {
+		throw new Error("Goal Plus Candidate Child must have a Message-only Capability grant");
+	}
+	await ensureWorkerRegistration(client, parentId, ctx);
+}
+
+async function runWorkerMessageRpc(
+	name: string,
+	params: Record<string, unknown>,
+	ctx: ExtensionContext,
+	signal: AbortSignal,
+) {
+	const suppliedSession = params.agent_session_id;
+	if (typeof suppliedSession === "string" && suppliedSession.length > 0) {
+		workerAgentSessionId = workerAgentSessionId ?? suppliedSession;
+		if (workerAgentSessionId !== suppliedSession) {
+			throw new Error("worker agent_session_id changed within one retained Session");
+		}
+	}
+	if (!workerAgentSessionId) {
+		throw new Error("call search_get_agent_context with agent_session_id first");
+	}
+	const client = await workerAgentPosixClient();
+	const self = await client.invoke("self", {});
+	const parentId = self.parentThinkthreadId;
+	if (typeof parentId !== "string") {
+		throw new Error("Message-backed Goal Plus tools require a ThinkThread Child");
+	}
+	await ensureWorkerRegistration(client, parentId, ctx);
+	const requestId = `rpc_${randomUUID().replaceAll("-", "")}`;
+	const hashPayload = {
+		agent_session_id: workerAgentSessionId,
+		tool: name,
+		params,
+	};
+	const contentJson = canonicalJson(hashPayload);
+	const request = {
+		protocol: "goal-plus.pi-thinkthread.v2",
+		type: "request",
+		request_id: requestId,
+		...hashPayload,
+		content_json: contentJson,
+		content_sha256: sha256(contentJson),
+	};
+	await client.invoke("message.send", {
+		recipientThinkthreadId: parentId,
+		text: JSON.stringify(request),
+		wake: false,
+	});
+
+	const chunks = new Map<number, Uint8Array>();
+	let expectedChunks: number | undefined;
+	let responseHash: string | undefined;
+	const deadline = Date.now() + 15 * 60 * 1000;
+	while (Date.now() < deadline) {
+		if (signal.aborted) throw new Error("Goal Plus worker Message request was cancelled");
+		const receiveParams: Record<string, unknown> = {
+			senderThinkthreadId: parentId,
+			limit: 32,
+		};
+		if (workerMessageCursor) receiveParams.after = workerMessageCursor;
+		const batch = await client.invoke("message.receive", receiveParams);
+		if (typeof batch.nextCursor !== "string") {
+			throw new Error("Agent POSIX message.receive omitted nextCursor");
+		}
+		workerMessageCursor = batch.nextCursor;
+		for (const message of Array.isArray(batch.messages) ? batch.messages : []) {
+			if (!isRecord(message) || typeof message.text !== "string" || message.truncated === true) continue;
+			let envelope: unknown;
+			try {
+				envelope = JSON.parse(message.text);
+			} catch {
+				continue;
+			}
+			if (
+				!isRecord(envelope) ||
+				envelope.protocol !== "goal-plus.pi-thinkthread.v2" ||
+				envelope.type !== "response_chunk" ||
+				envelope.request_id !== requestId ||
+				typeof envelope.chunk_index !== "number" ||
+				typeof envelope.chunk_count !== "number" ||
+				typeof envelope.data_base64 !== "string" ||
+				typeof envelope.chunk_sha256 !== "string" ||
+				typeof envelope.response_sha256 !== "string"
+			) continue;
+			const data = Buffer.from(envelope.data_base64, "base64");
+			if (sha256(data) !== envelope.chunk_sha256) throw new Error("worker RPC chunk hash mismatch");
+			if (expectedChunks !== undefined && expectedChunks !== envelope.chunk_count) {
+				throw new Error("worker RPC chunk count changed");
+			}
+			if (responseHash !== undefined && responseHash !== envelope.response_sha256) {
+				throw new Error("worker RPC response hash changed");
+			}
+			expectedChunks = envelope.chunk_count;
+			responseHash = envelope.response_sha256;
+			chunks.set(envelope.chunk_index, data);
+		}
+		if (expectedChunks !== undefined && chunks.size === expectedChunks) {
+			const pieces = Array.from({ length: expectedChunks }, (_unused, index) => chunks.get(index));
+			if (pieces.some((piece) => piece === undefined)) throw new Error("worker RPC response has missing chunks");
+			const data = Buffer.concat(pieces as Uint8Array[]);
+			if (sha256(data) !== responseHash) throw new Error("worker RPC response hash mismatch");
+			const response = JSON.parse(data.toString("utf8"));
+			if (!isRecord(response) || typeof response.ok !== "boolean") {
+				throw new Error("worker RPC response envelope is invalid");
+			}
+			try {
+				await client.invoke("message.send", {
+					recipientThinkthreadId: parentId,
+					text: JSON.stringify({
+						protocol: "goal-plus.pi-thinkthread.v2",
+						type: "response_ack",
+						request_id: requestId,
+						response_sha256: responseHash,
+					}),
+					wake: false,
+				});
+			} catch {
+				// The response is already hash-verified. Root may safely replay its
+				// idempotent chunks if this best-effort acknowledgement was lost.
+			}
+			if (!response.ok) {
+				const error = isRecord(response.error) ? response.error : {};
+				throw new Error(typeof error.message === "string" ? error.message : "worker RPC failed");
+			}
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify(response.result, null, 2) }],
+				details: response.result,
+			};
+		}
+		await new Promise((resolve) => setTimeout(resolve, 200));
+	}
+	throw new Error(`worker RPC ${name} timed out waiting for Root`);
+}
+
 function persistGoalState(pi: ExtensionAPI) {
 	pi.appendEntry(STATE_ENTRY_TYPE, {
 		activeGoalPlusId,
