@@ -643,3 +643,254 @@ def _registration_from_message(
         and payload.get("type") == "registration"
         and payload.get("registration_nonce") == registration_nonce
     )
+
+
+def _recover_spawn_binding(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool: dict[str, Any],
+    job: dict[str, Any],
+) -> bool:
+    intent = job.get("spawn_intent")
+    if (
+        job.get("status") != "needs_recovery"
+        or not isinstance(intent, dict)
+        or intent.get("state") != "outcome_unknown"
+    ):
+        return False
+    observed_before = {
+        child_id
+        for child_id in intent.get("observed_children_before", [])
+        if isinstance(child_id, str)
+    }
+    already_bound = {
+        item.get("thinkthread_id")
+        for item in _jobs(root_dir, pool)
+        if item.get("job_id") != job.get("job_id")
+        and isinstance(item.get("thinkthread_id"), str)
+    }
+    listed = sdk.invoke("thinkthread.list").get("children")
+    if not isinstance(listed, list):
+        raise AgentPosixBridgeError("thinkthread.list omitted children")
+    expected_model = _selected_session(
+        runtime,
+        str(job["run_id"]),
+        str(job["candidate_id"]),
+    ).launch.get("model")
+    matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for child in listed:
+        if not isinstance(child, dict):
+            continue
+        child_id = child.get("thinkthreadId")
+        attachment = child.get("fs")
+        if (
+            not isinstance(child_id, str)
+            or child_id in observed_before
+            or child_id in already_bound
+            or _capabilities(child.get("capabilities")) != {"thinkthread.message"}
+            or not isinstance(attachment, dict)
+            or attachment.get("kind") != "private"
+            or (isinstance(expected_model, dict) and child.get("model") != expected_model)
+        ):
+            continue
+        batch = sdk.invoke(
+            "message.receive",
+            {
+                "senderThinkthreadId": child_id,
+                "limit": MESSAGE_RECEIVE_LIMIT,
+            },
+        )
+        messages = batch.get("messages")
+        if not isinstance(messages, list):
+            raise AgentPosixBridgeError("message.receive omitted messages")
+        if any(
+            isinstance(message, dict)
+            and _registration_from_message(message, str(job["registration_nonce"]))
+            for message in messages
+        ):
+            matches.append((child, batch))
+    if len(matches) != 1:
+        intent["recovery_candidates"] = [
+            child.get("thinkthreadId") for child, _batch in matches
+        ]
+        intent["last_recovery_at"] = utc_timestamp()
+        _write_job(root_dir, str(pool["pool_id"]), job)
+        return False
+
+    child, batch = matches[0]
+    session = _selected_session(
+        runtime,
+        str(job["run_id"]),
+        str(job["candidate_id"]),
+    )
+    _bind_spawn(
+        runtime,
+        str(job["run_id"]),
+        str(job["candidate_id"]),
+        session,
+        child,
+        job,
+    )
+    job["registered_at"] = utc_timestamp()
+    intent["state"] = "bound_after_recovery"
+    intent["recovered_at"] = utc_timestamp()
+    for message in batch.get("messages", []):
+        if not isinstance(message, dict) or _registration_from_message(
+            message,
+            str(job["registration_nonce"]),
+        ):
+            continue
+        _process_message(runtime, sdk, root_dir, job, message)
+    next_cursor = batch.get("nextCursor")
+    if not isinstance(next_cursor, str):
+        raise AgentPosixBridgeError("message.receive omitted nextCursor")
+    job["message_cursor"] = next_cursor
+    _write_job(root_dir, str(pool["pool_id"]), job)
+    return True
+
+
+def _request_hash(request: dict[str, Any]) -> str:
+    payload = {
+        "agent_session_id": request.get("agent_session_id"),
+        "tool": request.get("tool"),
+        "params": request.get("params"),
+    }
+    content_json = request.get("content_json")
+    if not isinstance(content_json, str):
+        raise ValueError("worker RPC content_json is required")
+    try:
+        decoded = json.loads(content_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("worker RPC content_json is invalid") from exc
+    if decoded != payload:
+        raise ValueError("worker RPC content_json does not match request fields")
+    return hashlib.sha256(content_json.encode("utf-8")).hexdigest()
+
+
+def _validate_request(job: dict[str, Any], request: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    if request.get("protocol") != PROTOCOL or request.get("type") != "request":
+        raise ValueError("unsupported worker RPC envelope")
+    request_id = request.get("request_id")
+    tool = request.get("tool")
+    params = request.get("params")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("worker RPC request_id is required")
+    if tool not in WORKER_TOOLS:
+        raise PermissionError(f"worker RPC tool is not allowed: {tool}")
+    if not isinstance(params, dict):
+        raise ValueError("worker RPC params must be an object")
+    if request.get("agent_session_id") != job["agent_session_id"]:
+        raise PermissionError("worker RPC agent_session_id binding mismatch")
+    expected_hash = _request_hash(request)
+    if request.get("content_sha256") != expected_hash:
+        raise ValueError("worker RPC content_sha256 mismatch")
+    return request_id, str(tool), params
+
+
+def _dispatch(
+    runtime: FileSearchRuntime,
+    job: dict[str, Any],
+    tool: str,
+    params: dict[str, Any],
+    *,
+    request_id: str,
+) -> Any:
+    tools = SearchTools(runtime)
+    session_id = str(job["agent_session_id"])
+    run_id = str(job["run_id"])
+    candidate_id = str(job["candidate_id"])
+    if "agent_session_id" in params and params["agent_session_id"] != session_id:
+        raise PermissionError("worker RPC session parameter mismatch")
+    if "run_id" in params and params["run_id"] != run_id:
+        raise PermissionError("worker RPC run parameter mismatch")
+    if tool != "search_get_evidence_detail" and "candidate_id" in params and params["candidate_id"] != candidate_id:
+        raise PermissionError("worker RPC candidate parameter mismatch")
+    if tool == "search_get_agent_context":
+        return tools.search_get_agent_context(session_id)
+    if tool == "search_get_global_evidence":
+        return tools.search_get_global_evidence(session_id)
+    if tool == "search_get_evidence_detail":
+        return tools.search_get_evidence_detail(
+            session_id,
+            str(params["candidate_id"]),
+            int(params["iteration"]),
+        )
+    if tool == "search_stage_shared_tool":
+        return runtime.stage_shared_tool(
+            session_id,
+            name=str(params["name"]),
+            summary=str(params["summary"]),
+            entrypoint=str(params["entrypoint"]),
+            candidate_relative_source_paths=list(
+                params["candidate_relative_source_paths"]
+            ),
+            idempotency_key=request_id,
+        )
+    if tool == "search_copy_shared_tool":
+        result = runtime.copy_shared_tool(
+            session_id,
+            str(params["tool_id"]),
+            str(params["snapshot_hash"]),
+            idempotency_key=request_id,
+        )
+        if result.get("state") == "copy_required_at_turn_boundary":
+            job.setdefault("copy_requirements", []).append(
+                {
+                    "state": "copy_required",
+                    "receipt_id": result["receipt_id"],
+                    "requested_at": utc_timestamp(),
+                }
+            )
+            _require_turn_boundary_wake(job, "shared_tool_copy")
+        return result
+    if tool == "search_run_verifier":
+        result = tools.search_run_verifier(
+            run_id=run_id,
+            candidate_id=candidate_id,
+            scope="process",
+            agent_session_id=session_id,
+            hypothesis=params.get("hypothesis"),
+            toolization_decision=params.get("toolization_decision"),
+            idempotency_key=request_id,
+        )
+        job["verifier_runs"] = int(job.get("verifier_runs", 0)) + 1
+        latest_record = runtime._load_candidate_record(run_id, candidate_id)
+        latest_iteration = (
+            latest_record.iterations[-1] if latest_record.iterations else None
+        )
+        if (
+            latest_iteration is not None
+            and latest_iteration.metrics.get("thinkthread_continuation_required")
+            is True
+        ):
+            job["checkpoint_continuation"] = {
+                "state": "required",
+                "iteration": latest_iteration.iteration,
+                "snapshot_id": (
+                    latest_iteration.attempt_ref.snapshot_id
+                    if isinstance(
+                        latest_iteration.attempt_ref, FsSnapshotArtifactRef
+                    )
+                    else None
+                ),
+                "required_at": utc_timestamp(),
+            }
+            _require_turn_boundary_wake(job, "checkpoint_resume")
+        if result.get("disposition") in {"discard", "failure"}:
+            target = result.get("workspace_artifact_after_settlement")
+            target_id = (
+                target.get("snapshot_id") if isinstance(target, dict) else None
+            )
+            if not isinstance(target_id, str):
+                raise RuntimeError("discard settlement omitted restore snapshot")
+            job["restore_required"] = {
+                "state": "restore_required",
+                "target_snapshot_id": target_id,
+                "requested_at": utc_timestamp(),
+            }
+            _require_turn_boundary_wake(job, "verifier_restore")
+        return result
+    if tool == "search_list_iterations":
+        return tools.search_list_iterations(run_id, candidate_id)
+    raise AssertionError(tool)
