@@ -1010,3 +1010,229 @@ def _retry_pending_responses(
             }
             record["last_attempt_unix"] = now
             record["last_attempt_at"] = utc_timestamp()
+
+
+def _process_message(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    job: dict[str, Any],
+    message: dict[str, Any],
+) -> None:
+    if message.get("senderThinkthreadId") != job.get("thinkthread_id"):
+        raise PermissionError("worker Message sender does not match bound Child")
+    text = message.get("text")
+    if not isinstance(text, str):
+        return
+    if message.get("truncated") is True:
+        if text.lstrip().startswith('{"protocol":"goal-plus.pi-thinkthread.'):
+            raise ValueError("worker RPC Message was truncated")
+        return
+    try:
+        request = json.loads(text)
+    except json.JSONDecodeError:
+        # ThinkThread also retains the Child's ordinary assistant completion
+        # on this direct Message stream.  It is observability, not an RPC
+        # envelope, and must not fail an otherwise valid pool job.
+        return
+    if not isinstance(request, dict) or request.get("protocol") != PROTOCOL:
+        return
+    if isinstance(request, dict) and request.get("type") == "registration":
+        if (
+            request.get("registration_nonce") != job.get("registration_nonce")
+        ):
+            raise PermissionError("Child registration nonce mismatch")
+        job["registered_at"] = utc_timestamp()
+        return
+    if isinstance(request, dict) and request.get("type") == "dispatch_ack":
+        nonce = request.get("dispatch_nonce")
+        records = job.setdefault("dispatch_records", [])
+        matching = next(
+            (
+                item
+                for item in records
+                if isinstance(item, dict)
+                and item.get("dispatch_nonce") == nonce
+            ),
+            None,
+        )
+        if matching is None and nonce in {
+            job.get("initial_dispatch_nonce"),
+            job.get("dispatch_nonce"),
+        }:
+            matching = {
+                "dispatch_nonce": nonce,
+                "stage": "legacy",
+                "state": "sent",
+            }
+            records.append(matching)
+        if request.get("protocol") != PROTOCOL or matching is None:
+            raise PermissionError("Child dispatch acknowledgement mismatch")
+        job["dispatch_ack_at"] = utc_timestamp()
+        job["dispatch_ack_nonce"] = nonce
+        matching["state"] = "acknowledged"
+        matching["acknowledged_at"] = job["dispatch_ack_at"]
+        wake_intent = job.get("wake_intent")
+        if isinstance(wake_intent, dict) and wake_intent.get("dispatch_nonce") == nonce:
+            wake_intent["state"] = "acknowledged"
+            wake_intent["acknowledged_at"] = utc_timestamp()
+            if job.get("status") == "needs_recovery":
+                job["status"] = "running"
+                job["error"] = None
+        return
+    if isinstance(request, dict) and request.get("type") == "response_ack":
+        if request.get("protocol") != PROTOCOL:
+            raise ValueError("unsupported worker response acknowledgement")
+        request_id = request.get("request_id")
+        pending = job.setdefault("pending_responses", {})
+        record = pending.get(request_id)
+        if not isinstance(request_id, str) or not isinstance(record, dict):
+            raise ValueError("unknown worker response acknowledgement")
+        if request.get("response_sha256") != record.get("response_sha256"):
+            raise ValueError("worker response acknowledgement hash mismatch")
+        settled_record = job.setdefault("settled_requests", {}).get(request_id)
+        if isinstance(settled_record, dict):
+            settled_record["response_ack_at"] = utc_timestamp()
+        pending.pop(request_id, None)
+        return
+    if not isinstance(job.get("registered_at"), str):
+        raise PermissionError("worker RPC arrived before Child registration")
+    request_id, tool, params = _validate_request(job, request)
+    settled = job.setdefault("settled_requests", {})
+    request_hash = _request_hash(request)
+    prior = settled.get(request_id)
+    if isinstance(prior, dict):
+        if prior.get("request_hash") != request_hash:
+            raise ValueError("settled worker RPC request_id was reused with new content")
+        response = prior["response"]
+    else:
+        intents = job.setdefault("request_intents", {})
+        intent = intents.get(request_id)
+        if isinstance(intent, dict):
+            if intent.get("request_hash") != request_hash:
+                raise ValueError(
+                    "in-flight worker RPC request_id was reused with new content"
+                )
+        else:
+            intent = {
+                "request_hash": request_hash,
+                "tool": tool,
+                "state": "platform_mutation_started",
+                "started_at": utc_timestamp(),
+            }
+            intents[request_id] = intent
+        # Persist the business idempotency key before any runtime mutation.
+        _write_job(root_dir, str(job["pool_id"]), job)
+        try:
+            result = _dispatch(
+                runtime,
+                job,
+                tool,
+                params,
+                request_id=request_id,
+            )
+            response = {"ok": True, "result": result}
+        except Exception as exc:
+            if (
+                isinstance(exc, RuntimeError)
+                and "ThinkThreadRequestNeedsRecovery" in str(exc)
+            ):
+                intent["state"] = "needs_recovery"
+                intent["error"] = str(exc)
+                intent["updated_at"] = utc_timestamp()
+                job["status"] = "needs_recovery"
+                job["error"] = {
+                    "stage": "worker_rpc",
+                    "request_id": request_id,
+                    "message": str(exc),
+                }
+                _write_job(root_dir, str(job["pool_id"]), job)
+                raise _WorkerRpcNeedsRecovery(str(exc)) from exc
+            response = {
+                "ok": False,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        intent["state"] = "settled"
+        intent["settled_at"] = utc_timestamp()
+        settled[request_id] = {
+            "request_hash": request_hash,
+            "tool": tool,
+            "response": response,
+            "settled_at": utc_timestamp(),
+        }
+    job.setdefault("pending_responses", {})[request_id] = {
+        "response_sha256": _response_hash(response),
+        "reply_to_message_id": message.get("messageId"),
+        "attempts": 0,
+        "queued_at": utc_timestamp(),
+    }
+    # Durable settlement and response intent must precede Message transmission.
+    _write_job(root_dir, str(job["pool_id"]), job)
+    try:
+        _send_pending_response(sdk, job, request_id)
+    except AgentPosixBridgeError as exc:
+        pending = job["pending_responses"][request_id]
+        pending["last_error"] = {
+            "message": str(exc),
+            "error_code": exc.code,
+            "completion_unknown": exc.completion_unknown,
+        }
+        pending["last_attempt_unix"] = time.time()
+        pending["last_attempt_at"] = utc_timestamp()
+    _write_job(root_dir, str(job["pool_id"]), job)
+
+
+def _receive_job_messages(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    job: dict[str, Any],
+) -> bool:
+    child_id = job.get("thinkthread_id")
+    if not isinstance(child_id, str):
+        return False
+    _retry_pending_responses(sdk, job)
+    params: dict[str, Any] = {
+        "senderThinkthreadId": child_id,
+        "limit": MESSAGE_RECEIVE_LIMIT,
+    }
+    if isinstance(job.get("message_cursor"), str):
+        params["after"] = job["message_cursor"]
+    batch = sdk.invoke("message.receive", params)
+    messages = batch.get("messages")
+    if not isinstance(messages, list):
+        raise AgentPosixBridgeError("message.receive omitted messages")
+    handled = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        try:
+            _process_message(runtime, sdk, root_dir, job, message)
+            handled = True
+        except (ValueError, PermissionError, json.JSONDecodeError) as exc:
+            job.setdefault("message_errors", []).append(
+                {
+                    "message_id": message.get("messageId"),
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                    "recorded_at": utc_timestamp(),
+                }
+            )
+            job["status"] = "failed"
+            job["finished_at"] = utc_timestamp()
+            job["error"] = {
+                "stage": "message_validation",
+                "message": str(exc),
+                "error_type": type(exc).__name__,
+            }
+            handled = True
+            break
+    next_cursor = batch.get("nextCursor")
+    if not isinstance(next_cursor, str):
+        raise AgentPosixBridgeError("message.receive omitted nextCursor")
+    job["message_cursor"] = next_cursor
+    _write_job(root_dir, str(job["pool_id"]), job)
+    return handled
