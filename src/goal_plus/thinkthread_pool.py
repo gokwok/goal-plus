@@ -1373,3 +1373,156 @@ def _ensure_branch_mutation_execution_absent(
     intent["updated_at"] = utc_timestamp()
     _write_job(root_dir, pool_id, job)
     return False
+
+
+def _apply_job_tool_copies(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool_id: str,
+    job: dict[str, Any],
+) -> bool:
+    requirements = job.get("copy_requirements")
+    if not isinstance(requirements, list):
+        return True
+    for requirement in requirements:
+        if not isinstance(requirement, dict) or requirement.get("state") == "applied":
+            continue
+        branch_id = job.get("fs_branch_id")
+        receipt_id = requirement.get("receipt_id")
+        if not isinstance(branch_id, str) or not isinstance(receipt_id, str):
+            raise RuntimeError("tool copy intent omitted branch or receipt")
+        if not _ensure_branch_mutation_execution_absent(
+            sdk,
+            root_dir,
+            pool_id,
+            job,
+        ):
+            requirement["state"] = "needs_recovery"
+            requirement["error"] = (
+                "retained Child execution remained present before shared tool copy"
+            )
+            _write_job(root_dir, pool_id, job)
+            return False
+        intent_id = requirement.get("snapshot_intent_id")
+        if not isinstance(intent_id, str):
+            intent_id = f"snapshot_{uuid.uuid4().hex}"
+            requirement["snapshot_intent_id"] = intent_id
+        requirement["state"] = "branch_snapshot_started"
+        _write_job(root_dir, pool_id, job)
+        try:
+            snapshot_request_id, source_snapshot_id = (
+                runtime.capture_pi_thinkthread_branch_snapshot(
+                    run_id=str(job["run_id"]),
+                    candidate_id=str(job["candidate_id"]),
+                    branch_id=branch_id,
+                    purpose=f"shared tool copy {receipt_id}",
+                    client=sdk,
+                    intent_id=intent_id,
+                )
+            )
+        except AgentPosixBridgeError as exc:
+            requirement["state"] = (
+                "needs_recovery" if exc.completion_unknown else "failed"
+            )
+            requirement["error"] = str(exc)
+            _write_job(root_dir, pool_id, job)
+            raise
+        except RuntimeError as exc:
+            requirement["state"] = "needs_recovery"
+            requirement["error"] = str(exc)
+            _write_job(root_dir, pool_id, job)
+            return False
+        requirement.update(
+            {
+                "state": "branch_snapshot_created",
+                "source_snapshot_id": source_snapshot_id,
+                "snapshot_request_id": snapshot_request_id,
+            }
+        )
+        _write_job(root_dir, pool_id, job)
+        runtime._close_fs_requests_after_evidence(
+            str(job["run_id"]), [snapshot_request_id], sdk
+        )
+        patch_request_id, target_snapshot_id = runtime.patch_pi_thinkthread_tool_copy(
+            run_id=str(job["run_id"]),
+            candidate_id=str(job["candidate_id"]),
+            receipt_id=receipt_id,
+            source_snapshot_id=source_snapshot_id,
+            client=sdk,
+        )
+        branch = sdk.invoke("fs.branch.stat", {"branchId": branch_id})
+        generation = branch.get("controlGeneration")
+        if not isinstance(generation, int):
+            raise RuntimeError("fs.branch.stat omitted controlGeneration")
+        try:
+            sdk.invoke(
+                "fs.branch.reset",
+                {
+                    "branchId": branch_id,
+                    "toSnapshotId": target_snapshot_id,
+                    "ifGeneration": generation,
+                },
+                timeout_seconds=60.0,
+            )
+        except AgentPosixBridgeError as exc:
+            if not exc.completion_unknown:
+                raise
+            observed = sdk.invoke("fs.branch.stat", {"branchId": branch_id})
+            if observed.get("baseSnapshotId") != target_snapshot_id:
+                requirement["state"] = "needs_recovery"
+                requirement["error"] = str(exc)
+                _write_job(root_dir, pool_id, job)
+                return False
+        runtime.complete_pi_thinkthread_tool_copy(
+            run_id=str(job["run_id"]),
+            candidate_id=str(job["candidate_id"]),
+            receipt_id=receipt_id,
+            target_snapshot_id=target_snapshot_id,
+            request_id=patch_request_id,
+            client=sdk,
+        )
+        requirement.update(
+            {
+                "state": "applied",
+                "source_snapshot_id": source_snapshot_id,
+                "target_snapshot_id": target_snapshot_id,
+                "request_id": patch_request_id,
+                "snapshot_request_id": snapshot_request_id,
+                "applied_at": utc_timestamp(),
+            }
+        )
+        _write_job(root_dir, pool_id, job)
+    return True
+
+
+def _event(pool: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    kind: Literal["candidate_ready", "failed", "interrupted", "timed_out"]
+    kind = {
+        "completed": "candidate_ready",
+        "interrupted": "interrupted",
+        "timed_out": "timed_out",
+    }.get(str(job["status"]), "failed")
+    return WorkerPoolEvent(
+        event_id=f"event_{job['job_id']}",
+        host="pi-thinkthread",
+        pool_id=str(pool["pool_id"]),
+        kind=kind,
+        run_id=str(pool["run_id"]),
+        candidate_id=str(job["candidate_id"]),
+        job_id=str(job["job_id"]),
+        terminal=True,
+        agent_session_id=str(job["agent_session_id"]),
+        result={
+            "handle": {
+                "host": "pi-thinkthread",
+                "external_id": job.get("thinkthread_id"),
+                "metadata": {
+                    "fs_branch_id": job.get("fs_branch_id"),
+                    "completion": job.get("completion"),
+                    "verifier_runs": job.get("verifier_runs", 0),
+                },
+            },
+            "error": job.get("error"),
+        },
+    ).as_dict()
