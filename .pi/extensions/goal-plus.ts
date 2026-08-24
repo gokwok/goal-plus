@@ -1265,6 +1265,14 @@ function buildGoalPlusContext(status: GoalPlusStatusPayload): string {
 			`- description: ${action.description ?? ""}`,
 		);
 	}
+	if (isThinkThreadProfile) {
+		lines.push(
+			"",
+			"ThinkThread Profile contract：",
+			"- SearchSpec 使用 worker_host=pi-thinkthread 并省略 workspace。",
+			"- Candidate 只通过 Message-backed tools 访问 Root runtime；不要启动 legacy Pi RPC worker。",
+		);
+	}
 	return lines.join("\n");
 }
 
@@ -1403,6 +1411,12 @@ function buildGoalStartPrompt(
 		"- 如果尚未准备好进入 Search，在 Goal Mode 中继续，并在停止前更新 goal-plus 状态。",
 		"- 如果该记录要求最终检查，调用 goal_plus_prepare_final_check(checker_host=\"pi\")，然后把其 launch payload 传给 pi_goal_plus_run_final_check。",
 	);
+	if (isThinkThreadProfile) {
+		lines.push(
+			"- 当前是 ThinkThread Root Profile：冻结 SearchSpec 时必须使用 strategy.worker_host=\"pi-thinkthread\"，并完全省略 workspace 字段。不要使用 pi-rpc、Git worktree、goal-plus-pi-worker 或 pi --mode rpc Candidate 链路。",
+			"- Worker 模型发现使用 goal_plus_list_models(host=\"pi-thinkthread\")；只使用 Profile 实际 delegated 的 exact provider/model。reasoning effort 和 service tier 不受支持。",
+		);
+	}
 	return lines.join("\n");
 }
 
@@ -1514,14 +1528,6 @@ async function updateGoalPlusStart(
 async function resumeGoalPlusStart(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	if (isThinkThreadProfile) {
-		lines.push(
-			"",
-			"ThinkThread Profile contract：",
-			"- SearchSpec 使用 worker_host=pi-thinkthread 并省略 workspace。",
-			"- Candidate 只通过 Message-backed tools 访问 Root runtime；不要启动 legacy Pi RPC worker。",
-		);
-	}
 ): Promise<string | undefined> {
 	if (!activeGoalPlusId) {
 		ctx.ui.notify("No interrupted Goal Plus record to resume", "error");
@@ -1574,6 +1580,43 @@ function registerRuntimeTool(pi: ExtensionAPI, name: string) {
 				sawContext = true;
 			}
 			return result;
+		},
+	});
+}
+
+function registerWorkerMessageTool(pi: ExtensionAPI, name: string) {
+	pi.registerTool({
+		name,
+		label: name,
+		description:
+			RuntimeToolDescriptions[name] ??
+			`通过 ThinkThread Message 向 Root 请求 Goal Plus 工具 ${name}。`,
+		parameters: toolParameters(name),
+		executionMode: "sequential",
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			try {
+				const result = await runWorkerMessageRpc(
+					name,
+					params as Record<string, unknown>,
+					ctx,
+					signal,
+				);
+				if (name === "search_get_agent_context") {
+					workspaceRoot = process.cwd();
+					sawContext = true;
+				}
+				return result;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					content: [{ type: "text" as const, text: message }],
+					details: {
+						tool: name,
+						ok: false,
+						error: message,
+					},
+				};
+			}
 		},
 	});
 }
@@ -1660,12 +1703,6 @@ function workspaceGuard(event: ToolCallEvent) {
 	}
 	if (!workspaceRoot) return undefined;
 	if (!["edit", "write", "bash"].includes(event.toolName)) return undefined;
-	if (isThinkThreadProfile) {
-		lines.push(
-			"- 当前是 ThinkThread Root Profile：冻结 SearchSpec 时必须使用 strategy.worker_host=\"pi-thinkthread\"，并完全省略 workspace 字段。不要使用 pi-rpc、Git worktree、goal-plus-pi-worker 或 pi --mode rpc Candidate 链路。",
-			"- Worker 模型发现使用 goal_plus_list_models(host=\"pi-thinkthread\")；只使用 Profile 实际 delegated 的 exact provider/model。reasoning effort 和 service tier 不受支持。",
-		);
-	}
 	const target = extractCandidatePath(event);
 	if (target && target.includes("..")) {
 		return { block: true, reason: "workspaceGuard blocked parent-directory path." };
@@ -1760,6 +1797,7 @@ export default function (pi: ExtensionAPI) {
 		"search_freeze_spec",
 		"search_create",
 		"search_status",
+		"search_recover_pi_thinkthread",
 		"search_invalidate_run",
 		"search_list_history",
 		"search_plan_next",
@@ -1814,6 +1852,8 @@ export default function (pi: ExtensionAPI) {
 		return workspaceGuard(event) || (await mainGate(event, ctx));
 	});
 	pi.on("session_start", async (_event, ctx) => {
+		if (isThinkThreadProfile) await validateThinkThreadRole(ctx);
+		if (role === "worker") return;
 		restoreGoalState(ctx);
 		if (role !== "main" || !activeGoalPlusId) return;
 		const commandCtx = commandContextFrom(ctx);
@@ -1832,45 +1872,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 	pi.on("before_agent_start", async (_event, ctx) => {
+		if (isThinkThreadWorker) {
+			await acknowledgeWorkerDispatch(ctx);
+			return;
+		}
+		if (role === "worker") return;
 		if (role !== "main" || !activeGoalPlusId) return;
 		const commandCtx = commandContextFrom(ctx);
-function registerWorkerMessageTool(pi: ExtensionAPI, name: string) {
-	pi.registerTool({
-		name,
-		label: name,
-		description:
-			RuntimeToolDescriptions[name] ??
-			`通过 ThinkThread Message 向 Root 请求 Goal Plus 工具 ${name}。`,
-		parameters: toolParameters(name),
-		executionMode: "sequential",
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			try {
-				const result = await runWorkerMessageRpc(
-					name,
-					params as Record<string, unknown>,
-					ctx,
-					signal,
-				);
-				if (name === "search_get_agent_context") {
-					workspaceRoot = process.cwd();
-					sawContext = true;
-				}
-				return result;
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				return {
-					content: [{ type: "text" as const, text: message }],
-					details: {
-						tool: name,
-						ok: false,
-						error: message,
-					},
-				};
-			}
-		},
-	});
-}
-
 		const status = await refreshActiveGoal(pi, commandCtx, canPersistGoalState(ctx.mode));
 		if (!status || isTerminalStatus(status.status)) return;
 		return {
@@ -1955,11 +1963,3 @@ function registerWorkerMessageTool(pi: ExtensionAPI, name: string) {
 		}
 	});
 }
-		"search_recover_pi_thinkthread",
-		if (isThinkThreadProfile) await validateThinkThreadRole(ctx);
-		if (role === "worker") return;
-		if (isThinkThreadWorker) {
-			await acknowledgeWorkerDispatch(ctx);
-			return;
-		}
-		if (role === "worker") return;
