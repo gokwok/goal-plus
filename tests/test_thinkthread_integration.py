@@ -1702,3 +1702,239 @@ def test_exact_snapshot_verifier_normalizes_all_terminal_exits_and_truncation(
 
 
 @pytest.mark.pi
+def test_exact_snapshot_launch_failure_is_durable_infrastructure_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    original_invoke = client.invoke
+
+    def fail_run_once(operation: str, params=None, **kwargs):
+        normalized = dict(params or {})
+        if operation == "fs.run":
+            request_id = normalized["requestId"]
+            error = {
+                "code": "FsRunLaunchFailed",
+                "message": "exact Fs process could not be launched",
+                "retryable": True,
+            }
+            client.fs_request_status[request_id] = {
+                "requestId": request_id,
+                "method": "fs.run",
+                "state": "failed",
+                "acceptedAtUnixMs": 1,
+                "finishedAtUnixMs": 2,
+                "result": None,
+                "error": error,
+            }
+            from goal_plus.thinkthread_agent_posix import AgentPosixBridgeError
+
+            raise AgentPosixBridgeError(
+                "fs.run was rejected: FsRunLaunchFailed",
+                error={"response": {"error": error}},
+            )
+        return original_invoke(operation, params, **kwargs)
+
+    monkeypatch.setattr(client, "invoke", fail_run_once)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+
+    report = runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="record a transient exact execution launch failure",
+    )
+
+    assert report.process_passed is False
+    result = report.verifier_results[0]
+    assert result.failure_class == "VerifierInfrastructureFailure"
+    assert result.metrics["error_code"] == "FsRunLaunchFailed"
+    assert result.metrics["retryable"] is True
+    request = runtime._load_run(run_id).fs_requests[-1]
+    assert request.state == "closed"
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert record.iterations[-1].failure_class == "VerifierInfrastructureFailure"
+
+
+@pytest.mark.pi
+def test_selection_and_strict_publication_bind_the_exact_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="publish exact snapshot",
+    )
+
+    selection = runtime.select(run_id)
+    manifest_path = runtime.promote(run_id, task.candidate_id)
+
+    assert selection["selected_artifact_ref"] == {
+        "kind": "fs_snapshot",
+        "snapshot_id": "fsnap-attempt",
+    }
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["base_artifact_ref"]["snapshot_id"] == "fsnap-baseline"
+    assert manifest["target_artifact_ref"]["snapshot_id"] == "fsnap-attempt"
+    assert client.root_snapshot_id == "fsnap-attempt"
+    run = runtime._load_run(run_id)
+    assert run.state == "promoted"
+    assert run.publication is not None
+    assert run.publication.state == "committed"
+    assert run.fs_requests[-1].operation == "replace"
+    assert run.fs_requests[-1].state == "closed"
+
+    report_path = runtime.report(run_id)
+    report = report_path.read_text(encoding="utf-8")
+    assert '"kind":"fs_snapshot","snapshot_id":"fsnap-attempt"' in report
+    assert "durable ledger (1 rows)" in report
+    assert report_path.with_suffix(".html").is_file()
+
+
+@pytest.mark.pi
+def test_publication_response_loss_replays_terminal_request_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="publish despite a lost response",
+    )
+    runtime.select(run_id)
+    client.replace_completion_unknown_once = True
+
+    manifest = runtime.promote(run_id, task.candidate_id)
+
+    assert manifest.is_file()
+    assert client.root_snapshot_id == "fsnap-attempt"
+    assert sum(
+        operation == "fs.replace" for operation, _params in client.operations
+    ) == 1
+    assert any(
+        operation == "fs.request.status"
+        for operation, _params in client.operations
+    )
+    run = runtime._load_run(run_id)
+    assert run.state == "promoted"
+    assert run.publication is not None
+    assert run.publication.state == "committed"
+    assert run.fs_requests[-1].state == "closed"
+
+
+@pytest.mark.pi
+def test_publication_recovery_reconciles_selected_root_before_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    spec_payload = thinkthread_spec(project).model_dump(mode="json")
+    spec_payload["promotion_verifiers"] = list(spec_payload["process_verifiers"])
+    frozen = runtime.freeze_spec(
+        SearchSpec.model_validate(spec_payload),
+        [project / "evaluator.py"],
+    )
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    task = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=1).plan_id,
+    )[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="publish after exact promotion evidence",
+    )
+    runtime.select(run_id)
+    original_commit = runtime._commit_pi_thinkthread_publication
+    monkeypatch.setattr(
+        runtime,
+        "_commit_pi_thinkthread_publication",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated crash before publication manifest")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        runtime.promote(run_id, task.candidate_id)
+
+    assert client.root_snapshot_id == "fsnap-attempt"
+    verifier_runs_before_recovery = len(client.run_params)
+    monkeypatch.setattr(runtime, "_commit_pi_thinkthread_publication", original_commit)
+    original_invoke = client.invoke
+
+    def reject_redundant_verifier(operation: str, params=None, **kwargs):
+        if operation == "fs.run":
+            raise AssertionError("publication recovery reran promotion verifier")
+        return original_invoke(operation, params, **kwargs)
+
+    monkeypatch.setattr(client, "invoke", reject_redundant_verifier)
+
+    manifest_path = runtime.promote(run_id, task.candidate_id)
+
+    assert manifest_path.is_file()
+    assert len(client.run_params) == verifier_runs_before_recovery
+    assert runtime._load_run(run_id).publication.state == "committed"
+
+
+@pytest.mark.pi
