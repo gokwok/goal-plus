@@ -274,3 +274,215 @@ def _timestamp_epoch(value: Any) -> float | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def _lease_started_epoch(job: dict[str, Any]) -> float:
+    value = _timestamp_epoch(job.get("lease_started_unix"))
+    if value is not None:
+        return value
+    value = _timestamp_epoch(job.get("started_at"))
+    if value is not None:
+        return value
+    return time.time()
+
+
+def _lease_deadline_epoch(job: dict[str, Any]) -> float:
+    budget = job.get("worker_budget")
+    if not isinstance(budget, dict):
+        raise RuntimeError("pi-thinkthread pool job omitted worker_budget")
+    return _lease_started_epoch(job) + float(budget["max_runtime_seconds"])
+
+
+def _lease_satisfied(job: dict[str, Any], *, now: float | None = None) -> bool:
+    budget = job.get("worker_budget")
+    if not isinstance(budget, dict):
+        return False
+    current = time.time() if now is None else now
+    elapsed = max(0.0, current - _lease_started_epoch(job))
+    verifier_delta = max(
+        0,
+        int(job.get("verifier_runs", 0))
+        - int(job.get("lease_start_verifier_runs", 0)),
+    )
+    return (
+        elapsed >= float(budget.get("min_runtime_seconds") or 0)
+        and verifier_delta >= int(budget.get("min_verifier_runs") or 0)
+    )
+
+
+def _validate_run(
+    runtime: FileSearchRuntime,
+    run_id: str,
+    candidate_ids: list[str],
+    max_parallel: int | None,
+) -> tuple[Any, Any, int, str]:
+    run = runtime._load_run(run_id)
+    runtime._assert_run_not_invalidated(run, "open Pi ThinkThread pool")
+    frozen = runtime._load_frozen_spec(run.frozen_spec_id)
+    if frozen.spec.strategy.worker_host != "pi-thinkthread":
+        raise ValueError("pi-thinkthread pool requires worker_host='pi-thinkthread'")
+    baseline = run.baseline_artifact_ref
+    if not isinstance(baseline, FsSnapshotArtifactRef):
+        raise RuntimeError("pi-thinkthread run has no exact baseline snapshot")
+    limit = int(max_parallel or frozen.spec.budget.max_parallel)
+    if limit <= 0 or limit > frozen.spec.budget.max_parallel:
+        raise ValueError("max_parallel exceeds the frozen Search limit")
+    if len(candidate_ids) > limit:
+        raise ValueError("initial candidate count exceeds max_parallel")
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("candidate_ids must be unique")
+    for candidate_id in candidate_ids:
+        record = runtime._load_candidate_record(run_id, candidate_id)
+        if record.status not in {"created", "evaluated"}:
+            raise RuntimeError(
+                f"cannot dispatch candidate {candidate_id} in status {record.status}"
+            )
+        # The host-owned pool is the public launch surface.  Persist the
+        # Search provenance session here before the Child spawn, matching the
+        # legacy Pi pool contract and making a retried pool-open idempotently
+        # recover a turn interrupted between start_batch and pool_open.
+        if not any(
+            session.candidate_id == candidate_id
+            and session.host == "pi-thinkthread"
+            for session in runtime._load_agent_sessions(run_id)
+        ):
+            runtime.start_agent_session(run_id, candidate_id)
+        _selected_session(runtime, run_id, candidate_id)
+    return run, frozen, limit, baseline.snapshot_id
+
+
+def _assert_root(client: AgentPosixSdkClient) -> dict[str, Any]:
+    client.preflight()
+    view = client.self_view()
+    if view.get("parentThinkthreadId") is not None:
+        raise RuntimeError("pi-thinkthread pool controller must run in Root")
+    missing = {
+        "thinkthread.child",
+        "thinkthread.message",
+        "thinkthread.fs",
+    } - _capabilities(view.get("capabilities"))
+    if missing:
+        raise RuntimeError(
+            "pi-thinkthread Root lacks capabilities: " + ", ".join(sorted(missing))
+        )
+    fs = client.invoke("fs.stat")
+    if fs.get("kind") != "direct":
+        raise RuntimeError("pi-thinkthread Root filesystem must be direct")
+    storage = fs.get("storage")
+    if isinstance(storage, dict):
+        snapshot_count = int(storage.get("snapshotCount", 0)) + int(
+            storage.get("pendingSnapshotCreations", 0)
+        )
+        if snapshot_count >= int(storage.get("snapshotLimit", 1)):
+            raise RuntimeError("ThinkThread snapshot quota is exhausted")
+        if int(storage.get("requestCount", 0)) >= int(
+            storage.get("requestLimit", 1)
+        ):
+            raise RuntimeError("ThinkThread durable request quota is exhausted")
+        if int(storage.get("activeRequestCount", 0)) >= int(
+            storage.get("activeRequestLimit", 1)
+        ):
+            raise RuntimeError("ThinkThread active filesystem operation quota is exhausted")
+        if int(storage.get("snapshotLogicalBytes", 0)) >= int(
+            storage.get("snapshotLogicalByteLimit", 1)
+        ):
+            raise RuntimeError("ThinkThread snapshot logical byte quota is exhausted")
+    return view
+
+
+def _spawn_params(
+    launch: dict[str, Any],
+    baseline_snapshot_id: str,
+    registration_nonce: str,
+    dispatch_nonce: str,
+) -> dict[str, Any]:
+    message = str(launch.get("message") or "")
+    message += (
+        "\n\nThinkThread registration: "
+        f"protocol={PROTOCOL}; registration_nonce={registration_nonce}; "
+        f"dispatch_nonce={dispatch_nonce}."
+    )
+    params: dict[str, Any] = {
+        "profile": str(launch.get("profile") or "self"),
+        "fs": "private",
+        "fsSnapshotId": baseline_snapshot_id,
+        "capabilities": ["thinkthread.message"],
+        "initialMessage": message,
+    }
+    model = launch.get("model")
+    if isinstance(model, dict):
+        params["model"] = model
+    return params
+
+
+def _bind_spawn(
+    runtime: FileSearchRuntime,
+    run_id: str,
+    candidate_id: str,
+    session: Any,
+    result: dict[str, Any],
+    job: dict[str, Any],
+) -> None:
+    child_id = result.get("thinkthreadId")
+    attachment = result.get("fs")
+    branch_id = attachment.get("fsBranchId") if isinstance(attachment, dict) else None
+    if not isinstance(child_id, str) or not child_id.startswith("tt-"):
+        raise RuntimeError("thinkthread.spawn omitted thinkthreadId")
+    if (
+        not isinstance(attachment, dict)
+        or attachment.get("kind") != "private"
+        or not isinstance(branch_id, str)
+        or not branch_id.startswith("fsbranch-")
+    ):
+        raise RuntimeError("thinkthread.spawn omitted private fsBranchId")
+    if _capabilities(result.get("capabilities")) != {"thinkthread.message"}:
+        raise RuntimeError("ThinkThread Child grant is not Message-only")
+    expected_model = session.launch.get("model")
+    if isinstance(expected_model, dict) and result.get("model") != expected_model:
+        raise RuntimeError("ThinkThread Child model does not match selected model")
+
+    with runtime._run_transaction(run_id):
+        record = runtime._load_candidate_record(run_id, candidate_id)
+        record.task.fs_branch_id = branch_id
+        record.task.strategy_metadata["thinkthread_id"] = child_id
+        record.task.strategy_metadata["fs_branch_id"] = branch_id
+        runtime._write_candidate_record(run_id, record)
+    runtime.bind_agent_handle(
+        session.agent_session_id,
+        {
+            "host": "pi-thinkthread",
+            "external_id": child_id,
+            "metadata": {
+                "continuation": "retained_child_session",
+                "fs_branch_id": branch_id,
+                "initial_message_id": result.get("initialMessageId"),
+                "model": result.get("model"),
+                "capabilities": sorted(_capabilities(result.get("capabilities"))),
+            },
+        },
+    )
+    job.update(
+        {
+            "thinkthread_id": child_id,
+            "fs_branch_id": branch_id,
+            "initial_message_id": result.get("initialMessageId"),
+            "active_message_id": result.get("initialMessageId"),
+            "model": result.get("model"),
+            "status": "running",
+            "started_at": utc_timestamp(),
+        }
+    )
+    initial_nonce = job.get("initial_dispatch_nonce") or job.get("dispatch_nonce")
+    initial_dispatch = next(
+        (
+            item
+            for item in job.get("dispatch_records", [])
+            if isinstance(item, dict)
+            and item.get("dispatch_nonce") == initial_nonce
+        ),
+        None,
+    )
+    if isinstance(initial_dispatch, dict):
+        initial_dispatch["state"] = "sent"
+        initial_dispatch["message_id"] = result.get("initialMessageId")
+        initial_dispatch["sent_at"] = job["started_at"]
