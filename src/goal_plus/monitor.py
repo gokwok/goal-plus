@@ -821,7 +821,30 @@ def goal_plus_monitor_snapshot(
             "selected_candidate_id": run.selected_candidate_id,
             "selected_score": run.selected_score,
             "selected_iteration": run.selected_iteration,
+            "baseline_artifact_ref": (
+                run.baseline_artifact_ref.model_dump(mode="json")
+                if run.baseline_artifact_ref is not None
+                else None
+            ),
+            "selected_artifact_ref": (
+                run.selected_artifact_ref.model_dump(mode="json")
+                if run.selected_artifact_ref is not None
+                else None
+            ),
             "selected_git_head": run.selected_git_head,
+            "publication": (
+                run.publication.model_dump(mode="json")
+                if run.publication is not None
+                else None
+            ),
+            "fs_requests": {
+                "total": len(run.fs_requests),
+                "state_counts": {
+                    state: sum(1 for item in run.fs_requests if item.state == state)
+                    for state in sorted({item.state for item in run.fs_requests})
+                },
+            },
+            "fs_cleanup": run.fs_cleanup,
             "budget_used": run.budget_used,
             "evidence_annotations": _evidence_annotation_payload(run_path),
         }
@@ -830,9 +853,18 @@ def goal_plus_monitor_snapshot(
             candidate_sessions = sessions_by_candidate.get(candidate.candidate_id, [])
             last_iteration = candidate.iterations[-1] if candidate.iterations else None
             best_iteration = _best_iteration(candidate, frozen.spec.metric_direction)
-            results_path = candidate.task.workspace / RESULTS_TSV_RELATIVE_PATH
-            results_tsv = _path_info(str(results_path))
+            results_path = (
+                candidate.task.workspace / RESULTS_TSV_RELATIVE_PATH
+                if candidate.task.workspace is not None
+                else None
+            )
+            results_tsv = _path_info(
+                str(results_path) if results_path is not None else None
+            )
             results_tsv["row_count"] = len(candidate.results_ledger)
+            results_tsv["storage"] = (
+                "workspace_file" if results_path is not None else "durable_record"
+            )
             shared_status_counts: dict[str, int] = {}
             toolization_outcome_counts: dict[str, int] = {}
             toolization_signal_counts: dict[str, int] = {}
@@ -877,10 +909,25 @@ def goal_plus_monitor_snapshot(
                 ),
                 "last_verifier_at": last_iteration.created_at if last_iteration else None,
                 "last_git_head": last_iteration.git_head if last_iteration else None,
+                "last_artifact_ref": (
+                    last_iteration.attempt_ref.model_dump(mode="json")
+                    if last_iteration and last_iteration.attempt_ref is not None
+                    else None
+                ),
                 "best_iteration": best_iteration.iteration if best_iteration else None,
                 "best_iteration_score": best_iteration.score if best_iteration else None,
                 "best_iteration_at": best_iteration.created_at if best_iteration else None,
                 "best_iteration_git_head": best_iteration.git_head if best_iteration else None,
+                "best_iteration_artifact_ref": (
+                    best_iteration.attempt_ref.model_dump(mode="json")
+                    if best_iteration and best_iteration.attempt_ref is not None
+                    else None
+                ),
+                "settled_artifact_ref": (
+                    candidate.settled_artifact_ref.model_dump(mode="json")
+                    if candidate.settled_artifact_ref is not None
+                    else None
+                ),
                 "workspace_git_head_after_settlement": (
                     last_iteration.workspace_git_head_after_settlement
                     if last_iteration

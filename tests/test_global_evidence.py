@@ -9,6 +9,7 @@ import pytest
 
 from goal_plus.models import (
     EvidenceViewRecord,
+    GitCommitArtifactRef,
     SearchSpec,
     SupplementalEvaluation,
 )
@@ -57,6 +58,83 @@ def _search_with_candidates(
 
 def _git(workspace: Path, *args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=workspace, text=True).strip()
+
+
+def test_git_evidence_uses_artifact_refs_and_reader_for_annotation_and_peers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(SUPPLEMENTAL_EVALUATION_ENABLED_ENV, "1")
+    runtime, run_id, candidates = _search_with_candidates(tmp_path, 2)
+    for candidate, value in zip(candidates, (1, 2), strict=True):
+        candidate_id, session_id, workspace = candidate
+        (workspace / "initial_program.py").write_text(
+            f"VALUE = {value}\n",
+            encoding="utf-8",
+        )
+        runtime.run_verifier(
+            run_id,
+            candidate_id,
+            agent_session_id=session_id,
+            hypothesis=f"Set the candidate value to {value}",
+        )
+
+    second_record = runtime._load_candidate_record(run_id, candidates[1][0])
+    iteration = second_record.iterations[0]
+    assert isinstance(iteration.attempt_base_ref, GitCommitArtifactRef)
+    assert isinstance(iteration.attempt_ref, GitCommitArtifactRef)
+    assert iteration.settled_ref == iteration.attempt_ref
+    assert second_record.results_ledger[0].artifact_ref == iteration.attempt_ref
+    assert second_record.settled_artifact_ref == iteration.attempt_ref
+    annotation_task = runtime._load_evidence_annotation_task(
+        run_id,
+        candidates[1][0],
+        1,
+    )
+    assert annotation_task is not None
+    assert annotation_task.attempt_ref == iteration.attempt_ref
+    assert annotation_task.comparison_basis
+    assert isinstance(
+        annotation_task.comparison_basis[0].artifact_ref,
+        GitCommitArtifactRef,
+    )
+
+    def legacy_git_path(*_args, **_kwargs):
+        raise AssertionError("Evidence must read artifacts through GitArtifactReader")
+
+    monkeypatch.setattr(runtime, "_git_changed_files", legacy_git_path)
+    monkeypatch.setattr(runtime, "_git_output_bounded", legacy_git_path)
+    context = runtime._evidence_annotation_context(
+        run_id,
+        candidates[1][0],
+        1,
+    )
+    assert context["exact_attempt_artifact_ref"] == {
+        "kind": "git_commit",
+        "commit": iteration.git_head,
+    }
+    assert "+VALUE = 2" in context["actual_diff"]
+    assert context["peer_evidence"][0]["artifact_ref"]["kind"] == "git_commit"
+    evidence = runtime.get_global_evidence(candidates[1][1])
+    assert all(entry["artifact_ref"]["kind"] == "git_commit" for entry in evidence)
+    best = json.loads(
+        (runtime._run_dir(run_id) / "best.json").read_text(encoding="utf-8")
+    )
+    assert best["schema_version"] == 2
+    assert best["artifact_ref"] == {
+        "kind": "git_commit",
+        "commit": iteration.git_head,
+    }
+
+    selected = runtime.select(run_id)
+    assert selected["selected_candidate_id"] == candidates[1][0]
+    selected_run = runtime._load_run(run_id)
+    assert selected_run.selected_artifact_ref == iteration.attempt_ref
+    runtime.run_verifier(run_id, candidates[1][0], scope="promotion")
+    promoted_record = runtime._load_candidate_record(run_id, candidates[1][0])
+    assert promoted_record.promotion_evidence is not None
+    assert promoted_record.promotion_evidence.selected_artifact_ref == iteration.attempt_ref
+    assert promoted_record.promotion_evidence.artifact_ref == iteration.attempt_ref
 
 
 def test_global_evidence_is_immediate_and_view_is_late_bound(tmp_path: Path) -> None:

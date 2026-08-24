@@ -939,6 +939,18 @@ def _html(value: Any) -> str:
     return escape(_text(value), quote=True)
 
 
+def _artifact_identity(reference: Any, git_head: Any = None) -> str | None:
+    if isinstance(reference, dict):
+        kind = str(reference.get("kind") or "artifact")
+        identifier = reference.get("snapshot_id") or reference.get("commit")
+        if isinstance(identifier, str) and identifier:
+            return f"{kind}:{identifier}"
+        return json.dumps(reference, sort_keys=True, separators=(",", ":"))
+    if isinstance(git_head, str) and git_head:
+        return git_head
+    return None
+
+
 def _epoch(value: str | None) -> float | None:
     if not value:
         return None
@@ -1302,6 +1314,10 @@ def _report_iteration_payload(
         annotation.run_id != run_id
         or annotation.candidate_id != candidate_id
         or annotation.iteration != iteration.iteration
+        or (
+            annotation.attempt_ref is not None
+            and annotation.attempt_ref != iteration.attempt_ref
+        )
         or annotation.attempt_commit != iteration.git_head
     ):
         raise RuntimeError("evidence annotation does not match iteration")
@@ -1315,6 +1331,10 @@ def _report_iteration_payload(
         view.run_id != run_id
         or view.candidate_id != candidate_id
         or view.iteration != iteration.iteration
+        or (
+            view.attempt_ref is not None
+            and view.attempt_ref != iteration.attempt_ref
+        )
         or view.attempt_commit != iteration.git_head
     ):
         raise RuntimeError("evidence view does not match iteration")
@@ -1350,6 +1370,11 @@ def _report_iteration_payload(
         "hypothesis": iteration.hypothesis,
         "summary": iteration.summary,
         "failure_class": iteration.failure_class,
+        "artifact_ref": (
+            iteration.attempt_ref.model_dump(mode="json")
+            if iteration.attempt_ref is not None
+            else None
+        ),
         "git_head": iteration.git_head,
         "disposition": iteration.disposition,
         "restored_to_iteration": iteration.restored_to_iteration,
@@ -1471,6 +1496,16 @@ def _task_details(
                 ),
                 "best_iteration": best.iteration if best is not None else None,
                 "best_score": best.score if best is not None else None,
+                "best_artifact_ref": (
+                    best.attempt_ref.model_dump(mode="json")
+                    if best is not None and best.attempt_ref is not None
+                    else None
+                ),
+                "settled_artifact_ref": (
+                    candidate.settled_artifact_ref.model_dump(mode="json")
+                    if candidate.settled_artifact_ref is not None
+                    else None
+                ),
                 "iterations_total": len(candidate.iterations),
                 "session_ids": session_ids_by_candidate.get(candidate.candidate_id, []),
                 "changed_files": candidate.detected_changed_files,
@@ -3622,7 +3657,7 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
         candidate_id = str(item.get("candidate_id") or "")
         disposition = str(item.get("disposition") or "unsettled")
         view_state = str(item.get("view_state") or "not_requested")
-        commit = str(item.get("git_head") or "")
+        revision = _artifact_identity(item.get("artifact_ref"), item.get("git_head"))
         evidence_source = item.get("evidence_source")
         view = item.get("view")
         tool_view_copy = published_tool_views(item)
@@ -3694,8 +3729,8 @@ def _render_shared_evidence_view(task: dict[str, Any]) -> str:
             f"<td>{toolization_copy}</td>"
             f"<td>{tool_view_copy}</td>"
             f"<td>{adoption_copy}</td>"
-            f'<td><code class="revision" title="{escape(commit, quote=True)}">'
-            f"{_html(commit[:12] if commit else None)}</code></td>"
+            f'<td><code class="revision" title="{escape(revision or "", quote=True)}">'
+            f"{_html(revision[:28] if revision else None)}</code></td>"
             "</tr>"
         )
 
@@ -3746,12 +3781,19 @@ def _render_candidates(task: dict[str, Any]) -> str:
         return "<p>No candidates were persisted.</p>"
     rows = []
     for candidate in candidates:
+        artifact = _artifact_identity(
+            candidate.get("best_artifact_ref")
+            or candidate.get("settled_artifact_ref"),
+            None,
+        )
         rows.append(
             f'<tr class="{"selected-row" if candidate.get("selected") else ""}">'
             f'<td class="mono"><strong>{_html(candidate.get("candidate_id"))}</strong></td>'
             f'<td>{_status("selected" if candidate.get("selected") else candidate.get("status"))}</td>'
             f'<td class="mono">{_html(_number(candidate.get("score")))}</td>'
             f'<td class="mono">{_html(_number(candidate.get("best_score")))}</td>'
+            f'<td><code class="revision" title="{escape(artifact or "", quote=True)}">'
+            f"{_html(artifact[:28] if artifact else None)}</code></td>"
             f'<td>{_html(candidate.get("process_passed"))}</td>'
             f'<td class="mono">{_html(candidate.get("iterations_total"))}</td>'
             f'<td class="mono">{_html(", ".join(candidate.get("session_ids") or []) or None)}</td>'
@@ -3762,7 +3804,7 @@ def _render_candidates(task: dict[str, Any]) -> str:
     return (
         '<div class="table-scroll"><table><thead><tr>'
         "<th>Candidate</th><th>Status</th><th>Final score</th><th>Best score</th>"
-        "<th>Process pass</th><th>Iterations</th><th>Sessions</th><th>Changed files</th><th>Hypothesis</th>"
+        "<th>Best artifact</th><th>Process pass</th><th>Iterations</th><th>Sessions</th><th>Changed files</th><th>Hypothesis</th>"
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
     )
 
