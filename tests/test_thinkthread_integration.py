@@ -2744,3 +2744,277 @@ def test_request_close_failure_is_retried_after_next_durable_evidence(
 
 
 @pytest.mark.pi
+def test_retained_wake_completion_unknown_recovers_from_dispatch_ack_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        final_verify=False,
+        client=client,
+    )
+    pool_id = opened["pool_id"]
+    child_id = opened["jobs"][0]["thinkthread_id"]
+    client.set_child_absent(child_id)
+    completed = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=3,
+        client=client,
+    )
+    assert completed["event"]["kind"] == "candidate_ready"
+
+    client.wake_completion_unknown_once = True
+    continued = continue_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        candidate_id=task.candidate_id,
+        final_verify=False,
+        client=client,
+    )
+    job = _load_job(runtime.root_dir, pool_id, continued["job_id"])
+    assert job["status"] == "needs_recovery"
+    assert job["wake_intent"]["state"] == "outcome_unknown"
+    job["status"] = "starting"
+    job["wake_intent"]["state"] = "platform_mutation_started"
+    _write_job(runtime.root_dir, pool_id, job)
+    wake_messages_before = len(
+        [message for message in client.sent_messages if message.get("wake") is True]
+    )
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "dispatch_ack",
+            "dispatch_nonce": job["dispatch_nonce"],
+        },
+    )
+
+    recovered = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert recovered["event"] is None
+    job = _load_job(runtime.root_dir, pool_id, continued["job_id"])
+    assert job["status"] == "running"
+    assert job["wake_intent"]["state"] == "acknowledged"
+    assert len(
+        [message for message in client.sent_messages if message.get("wake") is True]
+    ) == wake_messages_before
+
+    client.set_child_absent(child_id)
+    assert wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=3,
+        client=client,
+    )["event"]["kind"] == "candidate_ready"
+    close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        mode="drain",
+        client=client,
+    )
+
+
+@pytest.mark.pi
+def test_late_ack_for_prior_dispatch_does_not_fail_new_retained_wake(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        final_verify=False,
+        client=client,
+    )
+    pool_id = opened["pool_id"]
+    job_id = opened["jobs"][0]["job_id"]
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    child_id = job["thinkthread_id"]
+    initial_nonce = job["initial_dispatch_nonce"]
+
+    _send_retained_wake(
+        sdk=client,
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        job=job,
+        message="continue the same candidate",
+        stage="test_wake",
+    )
+    current_nonce = job["dispatch_nonce"]
+    assert current_nonce != initial_nonce
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "dispatch_ack",
+            "dispatch_nonce": initial_nonce,
+        },
+    )
+
+    result = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+
+    assert result["event"] is None
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["status"] == "running"
+    assert job["dispatch_nonce"] == current_nonce
+    assert job["dispatch_ack_nonce"] == initial_nonce
+    acknowledged = {
+        item["dispatch_nonce"]: item["state"]
+        for item in job["dispatch_records"]
+    }
+    assert acknowledged[initial_nonce] == "acknowledged"
+    assert acknowledged[current_nonce] == "sent"
+
+    close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        mode="interrupt",
+        client=client,
+    )
+
+
+@pytest.mark.pi
+def test_worker_deadline_escalates_int_then_term_and_reports_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.wait_rejections_before_absent = 1
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    pool_id = opened["pool_id"]
+    job_id = opened["jobs"][0]["job_id"]
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    job["lease_started_unix"] = 0
+    _write_job(runtime.root_dir, pool_id, job)
+
+    assert wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )["event"] is None
+    timed_out = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=0,
+        client=client,
+    )
+    assert timed_out["event"]["kind"] == "timed_out"
+    signals = [
+        params["signal"]
+        for operation, params in client.operations
+        if operation == "thinkthread.signal"
+    ]
+    assert signals == ["INT", "TERM"]
+    assert _load_job(runtime.root_dir, pool_id, job_id)["status"] == "timed_out"
+    close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        mode="drain",
+        client=client,
+    )
+
+
+@pytest.mark.pi
+def test_pool_close_escalates_typed_wait_timeout_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    client.wait_rejections_before_absent = 1
+
+    closed = close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=opened["pool_id"],
+        mode="interrupt",
+        timeout_seconds=0,
+        client=client,
+    )
+
+    signals = [
+        params["signal"]
+        for operation, params in client.operations
+        if operation == "thinkthread.signal"
+    ]
+    assert signals == ["INT", "TERM"]
+    assert closed["state"] == "closed"
+    assert closed["cleanup_observation"]["remaining_pool_children"] == []
+
+
