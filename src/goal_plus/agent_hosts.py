@@ -16,6 +16,10 @@ from goal_plus.host_observability import (
 )
 from goal_plus.models import AgentHostKind, AgentSessionRecord
 from goal_plus.paths import DEFAULT_RUNTIME_ROOT
+from goal_plus.thinkthread_agent_posix import (
+    AgentPosixBridgeError,
+    AgentPosixSdkClient,
+)
 
 
 PORTABLE_STRATEGY_MODES = {
@@ -758,9 +762,298 @@ class PiRpcAdapter:
         return payload
 
 
+class PiThinkThreadAdapter:
+    name: AgentHostKind = "pi-thinkthread"
+    adapter_version = "pi-thinkthread-agent-posix-v2"
+    capabilities = HostCapabilities(
+        supports_soft_closeout=True,
+        supports_model_discovery=True,
+        supports_model_override=True,
+        supports_reasoning_effort=False,
+        supports_service_tier=False,
+        supports_usage_metadata=True,
+        supports_process_kill=True,
+        pool=HostPoolContract(
+            launch_mode="async",
+            wait_mode="wait_any",
+            continuation_mode="native_session",
+            deadline_mode="worker_watchdog",
+            recovery_mode="supervisor_persisted",
+            completion_stage="candidate_ready",
+            open_tool="pi_search_pool_open",
+            wait_tool="pi_search_pool_wait_any",
+            snapshot_tool="pi_search_pool_snapshot",
+            continue_tool="pi_search_pool_continue",
+            closeout_tool="pi_search_pool_close",
+            interrupt_tool="pi_search_pool_close",
+        ),
+    )
+
+    @staticmethod
+    def _client() -> AgentPosixSdkClient:
+        return AgentPosixSdkClient()
+
+    def collect_observability(self, session: AgentSessionRecord) -> dict[str, Any]:
+        child_id = session.host_handle.external_id
+        if not child_id:
+            return {
+                "host": self.name,
+                "available": False,
+                "reason": "agent session is not bound to a ThinkThread Child",
+            }
+        try:
+            child = self._client().invoke("thinkthread.get", {"id": child_id})
+        except AgentPosixBridgeError as exc:
+            return {
+                "host": self.name,
+                "available": False,
+                "reason": str(exc),
+                "error_code": exc.code,
+            }
+        return {
+            "host": self.name,
+            "available": True,
+            "thinkthread_id": child.get("thinkthreadId"),
+            "agent_state": child.get("agentState"),
+            "execution_state": child.get("executionState"),
+            "pending_wake": child.get("pendingWake"),
+            "completion": child.get("completion"),
+            "last_wake_outcome": child.get("lastWakeOutcome"),
+            "model": child.get("model"),
+            "fs": child.get("fs"),
+        }
+
+    def list_available_models(
+        self,
+        query: str | None = None,
+    ) -> list[dict[str, Any]]:
+        client = self._client()
+        client.preflight()
+        self_view = client.self_view()
+        profiles = self_view.get("profiles")
+        if not isinstance(profiles, list):
+            raise AgentPosixBridgeError("Agent POSIX self view omitted profiles")
+        discovered: dict[str, dict[str, Any]] = {}
+        for raw_profile in profiles:
+            if not isinstance(raw_profile, dict):
+                continue
+            alias = raw_profile.get("alias")
+            revision = raw_profile.get("modelCatalogRevision")
+            allowed = raw_profile.get("allowedModels")
+            if not isinstance(allowed, list):
+                continue
+            for raw_model in allowed:
+                if not isinstance(raw_model, dict):
+                    continue
+                provider = raw_model.get("provider")
+                model_id = raw_model.get("model")
+                if not isinstance(provider, str) or not isinstance(model_id, str):
+                    continue
+                exact_ref = f"{provider}/{model_id}"
+                entry = discovered.setdefault(
+                    exact_ref,
+                    {
+                        "model": exact_ref,
+                        "model_id": model_id,
+                        "provider": provider,
+                        "display_name": model_id,
+                        "reasoning": None,
+                        "input_modalities": ["text"],
+                        "source": "thinkthread_agent_posix_self",
+                        "profile_aliases": [],
+                        "model_catalog_revisions": [],
+                    },
+                )
+                if isinstance(alias, str) and alias not in entry["profile_aliases"]:
+                    entry["profile_aliases"].append(alias)
+                if (
+                    isinstance(revision, str)
+                    and revision not in entry["model_catalog_revisions"]
+                ):
+                    entry["model_catalog_revisions"].append(revision)
+        models = [discovered[key] for key in sorted(discovered)]
+        return _filter_available_models(models, query)
+
+    @staticmethod
+    def _validate_worker_launch(
+        worker_launch: dict[str, Any] | None,
+    ) -> dict[str, str] | None:
+        if not worker_launch:
+            return None
+        for field_name in ("reasoning_effort", "service_tier"):
+            if worker_launch.get(field_name) is not None:
+                raise UnsupportedHostCapability(
+                    f"pi-thinkthread does not support {field_name}"
+                )
+        model = worker_launch.get("model")
+        if model is None:
+            return None
+        if not isinstance(model, str) or "/" not in model:
+            raise UnsupportedHostCapability(
+                "pi-thinkthread model selection requires exact provider/model"
+            )
+        provider, model_id = model.split("/", 1)
+        if not provider or not model_id:
+            raise UnsupportedHostCapability(
+                "pi-thinkthread model selection requires exact provider/model"
+            )
+        return {"provider": provider, "model": model_id}
+
+    @staticmethod
+    def _budget_control(
+        worker_budget: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not worker_budget:
+            return None
+        max_runtime_seconds = worker_budget.get("max_runtime_seconds")
+        control: dict[str, Any] = {
+            "mode": "thinkthread_child_watchdog",
+            "max_runtime_seconds": max_runtime_seconds,
+            "on_exceed": worker_budget.get("on_exceed", "interrupt"),
+            "interrupt_sequence": ["INT", "TERM"],
+            "continuation": "retained_child_session",
+        }
+        if max_runtime_seconds is not None:
+            control["soft_closeout_seconds"] = _pi_soft_closeout_seconds(
+                int(max_runtime_seconds),
+                int(worker_budget["min_runtime_seconds"])
+                if worker_budget.get("min_runtime_seconds") is not None
+                else None,
+            )
+        if (
+            worker_budget.get("min_runtime_seconds") is not None
+            or worker_budget.get("min_verifier_runs") is not None
+        ):
+            control["autoresearch_lease"] = {
+                "mode": "thinkthread_pool_controller",
+                "min_runtime_seconds": int(
+                    worker_budget.get("min_runtime_seconds") or 0
+                ),
+                "min_verifier_runs": int(worker_budget.get("min_verifier_runs") or 1),
+                "start_event": "initial_child_dispatch",
+                "cumulative_across_wakes": True,
+            }
+        if worker_budget.get("max_turns") is not None:
+            control["max_turns_hint"] = worker_budget["max_turns"]
+        return control
+
+    @staticmethod
+    def _message(
+        *,
+        worker_prompt: str | None,
+        agent_session_id: str,
+        candidate_id: str,
+        one_paragraph_idea: str,
+        worker_budget: dict[str, Any] | None,
+        resume: bool,
+    ) -> str:
+        header = (worker_prompt or "首先调用 search_get_agent_context。").strip()
+        if resume:
+            header += (
+                "\n\n继续同一个 retained ThinkThread Child Session 和 private branch。"
+                "刷新运行时上下文与 Global Evidence 后继续自主搜索。"
+            )
+        return (
+            f"{header}\n\n"
+            f"continue_existing_agent_session={'true' if resume else 'false'}; "
+            f"agent_session_id={agent_session_id}; candidate_id={candidate_id}; "
+            f"assigned_worker_budget={worker_budget or 'host 默认值'}; "
+            f"思路：{one_paragraph_idea}"
+        )
+
+    def build_launch_payload(
+        self,
+        *,
+        worker_agent_type: str | None,
+        candidate_id: str,
+        agent_session_id: str,
+        short_intent: str,
+        one_paragraph_idea: str,
+        worker_budget: dict[str, Any] | None = None,
+        worker_launch: dict[str, Any] | None = None,
+        root: str | None = None,
+        cwd: str | None = None,
+        worker_prompt: str | None = None,
+    ) -> dict[str, Any]:
+        model = self._validate_worker_launch(worker_launch)
+        payload: dict[str, Any] = {
+            "tool": "pi_thinkthread_child",
+            "agent_session_id": agent_session_id,
+            "candidate_id": candidate_id,
+            "session_id": agent_session_id,
+            "root": root or DEFAULT_RUNTIME_ROOT,
+            "description": f"{candidate_id} {short_intent}",
+            "profile": "self",
+            "fs": "private",
+            "capabilities": ["thinkthread.message"],
+            "continuation": "retained_child_session",
+            "message": self._message(
+                worker_prompt=worker_prompt,
+                agent_session_id=agent_session_id,
+                candidate_id=candidate_id,
+                one_paragraph_idea=one_paragraph_idea,
+                worker_budget=worker_budget,
+                resume=False,
+            ),
+        }
+        if model is not None:
+            payload["model"] = model
+        budget_control = self._budget_control(worker_budget)
+        if budget_control:
+            payload["budget_control"] = budget_control
+        return payload
+
+    def build_continue_payload(
+        self,
+        *,
+        worker_agent_type: str | None,
+        candidate_id: str,
+        agent_session_id: str,
+        external_id: str | None,
+        task_name: str | None,
+        short_intent: str,
+        one_paragraph_idea: str,
+        root: str | None = None,
+        cwd: str | None = None,
+        worker_prompt: str | None = None,
+        worker_budget: dict[str, Any] | None = None,
+        worker_launch: dict[str, Any] | None = None,
+        host_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not external_id:
+            raise UnsupportedHostCapability(
+                "pi-thinkthread continuation requires a bound Child id"
+            )
+        model = self._validate_worker_launch(worker_launch)
+        payload: dict[str, Any] = {
+            "tool": "pi_thinkthread_child",
+            "agent_session_id": agent_session_id,
+            "candidate_id": candidate_id,
+            "thinkthread_id": external_id,
+            "root": root or DEFAULT_RUNTIME_ROOT,
+            "description": f"{candidate_id} {short_intent}",
+            "continuation": "retained_child_session",
+            "wake": True,
+            "message": self._message(
+                worker_prompt=worker_prompt,
+                agent_session_id=agent_session_id,
+                candidate_id=candidate_id,
+                one_paragraph_idea=one_paragraph_idea,
+                worker_budget=worker_budget,
+                resume=True,
+            ),
+        }
+        if model is not None:
+            payload["model"] = model
+        budget_control = self._budget_control(worker_budget)
+        if budget_control:
+            payload["budget_control"] = budget_control
+        return payload
+
 _ADAPTERS: dict[AgentHostKind, AgentHostAdapter] = {
     "codex": CodexAdapter(),
     "pi-rpc": PiRpcAdapter(),
+    "pi-thinkthread": PiThinkThreadAdapter(),
 }
 
 
