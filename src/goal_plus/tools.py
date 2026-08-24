@@ -73,6 +73,12 @@ class SearchTools:
     def search_status(self, run_id: str) -> dict[str, Any]:
         return self.runtime.status(run_id).model_dump(mode="json")
 
+    def search_recover_pi_thinkthread(
+        self,
+        run_id: str,
+    ) -> dict[str, Any]:
+        return self.runtime.recover_pi_thinkthread_snapshot_requests(run_id)
+
     def search_list_history(
         self,
         run_id: str,
@@ -208,14 +214,20 @@ class SearchTools:
         agent_session_id: str | None = None,
         hypothesis: str | None = None,
         toolization_decision: ToolizationDecision | dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        verifier_kwargs: dict[str, Any] = {
+            "scope": scope,
+            "agent_session_id": agent_session_id,
+            "hypothesis": hypothesis,
+            "toolization_decision": toolization_decision,
+        }
+        if idempotency_key is not None:
+            verifier_kwargs["idempotency_key"] = idempotency_key
         report = self.runtime.run_verifier(
             run_id,
             candidate_id,
-            scope=scope,
-            agent_session_id=agent_session_id,
-            hypothesis=hypothesis,
-            toolization_decision=toolization_decision,
+            **verifier_kwargs,
         )
         result = report.model_dump(mode="json")
         if scope != "process" or agent_session_id is None:

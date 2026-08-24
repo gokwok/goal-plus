@@ -30,8 +30,106 @@ def test_json_line_reader_skips_noise_until_matching_response() -> None:
 def test_get_agent_host_adapter_returns_all_supported_hosts() -> None:
     assert get_agent_host_adapter("codex").name == "codex"
     assert get_agent_host_adapter("pi-rpc").name == "pi-rpc"
+    assert get_agent_host_adapter("pi-thinkthread").name == "pi-thinkthread"
     assert get_agent_host_adapter("codex").capabilities.supports_model_discovery
     assert get_agent_host_adapter("pi-rpc").capabilities.supports_model_discovery
+    assert get_agent_host_adapter(
+        "pi-thinkthread"
+    ).capabilities.supports_model_discovery
+
+
+@pytest.mark.pi
+def test_pi_thinkthread_lists_profile_delegated_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        def preflight(self):
+            return {}
+
+        def self_view(self):
+            return {
+                "profiles": [
+                    {
+                        "alias": "self",
+                        "modelCatalogRevision": "catalog-7",
+                        "allowedModels": [
+                            {"provider": "openai-codex", "model": "gpt-5.6-terra"}
+                        ],
+                    }
+                ]
+            }
+
+    adapter = get_agent_host_adapter("pi-thinkthread")
+    monkeypatch.setattr(adapter, "_client", lambda: FakeClient())
+
+    assert adapter.list_available_models("terra") == [
+        {
+            "model": "openai-codex/gpt-5.6-terra",
+            "model_id": "gpt-5.6-terra",
+            "provider": "openai-codex",
+            "display_name": "gpt-5.6-terra",
+            "reasoning": None,
+            "input_modalities": ["text"],
+            "source": "thinkthread_agent_posix_self",
+            "profile_aliases": ["self"],
+            "model_catalog_revisions": ["catalog-7"],
+        }
+    ]
+
+
+@pytest.mark.pi
+def test_pi_thinkthread_launch_and_retained_continuation() -> None:
+    adapter = get_agent_host_adapter("pi-thinkthread")
+    launch = adapter.build_launch_payload(
+        worker_agent_type=None,
+        candidate_id="c001",
+        agent_session_id="agent_0001",
+        short_intent="try",
+        one_paragraph_idea="try",
+        root="/runtime/goal-plus",
+        worker_budget={"max_runtime_seconds": 300, "on_exceed": "interrupt"},
+        worker_launch={"model": "openai-codex/gpt-5.6-terra"},
+    )
+
+    assert launch["tool"] == "pi_thinkthread_child"
+    assert launch["fs"] == "private"
+    assert launch["capabilities"] == ["thinkthread.message"]
+    assert launch["model"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-terra",
+    }
+    assert "workspace" not in launch
+    assert "cwd" not in launch
+
+    continued = adapter.build_continue_payload(
+        worker_agent_type=None,
+        candidate_id="c001",
+        agent_session_id="agent_0001",
+        external_id="tt-child-1",
+        task_name=None,
+        short_intent="continue",
+        one_paragraph_idea="continue",
+        root="/runtime/goal-plus",
+    )
+    assert continued["thinkthread_id"] == "tt-child-1"
+    assert continued["wake"] is True
+    assert continued["continuation"] == "retained_child_session"
+
+
+@pytest.mark.pi
+@pytest.mark.parametrize("field", ["reasoning_effort", "service_tier"])
+def test_pi_thinkthread_rejects_unsupported_launch_fields(field: str) -> None:
+    adapter = get_agent_host_adapter("pi-thinkthread")
+
+    with pytest.raises(UnsupportedHostCapability, match=field):
+        adapter.build_launch_payload(
+            worker_agent_type=None,
+            candidate_id="c001",
+            agent_session_id="agent_0001",
+            short_intent="try",
+            one_paragraph_idea="try",
+            worker_launch={field: "high"},
+        )
 
 
 @pytest.mark.codex

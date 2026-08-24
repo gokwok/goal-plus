@@ -370,6 +370,20 @@ def open_pi_search_pool(
     final_verify: bool = True,
     max_parallel: int | None = None,
 ) -> dict[str, Any]:
+    runtime = FileSearchRuntime(root_dir)
+    run = runtime._load_run(run_id)
+    frozen = runtime._load_frozen_spec(run.frozen_spec_id)
+    if frozen.spec.strategy.worker_host == "pi-thinkthread":
+        from goal_plus.thinkthread_pool import open_pool
+
+        return open_pool(
+            root_dir=root_dir,
+            run_id=run_id,
+            candidate_ids=candidate_ids,
+            worker_budgets=worker_budgets,
+            final_verify=final_verify,
+            max_parallel=max_parallel,
+        )
     selected_parallel = _validate_pool_run(root_dir, run_id, max_parallel)
     initial_ids = list(candidate_ids or [])
     if len(initial_ids) != len(set(initial_ids)):
@@ -580,6 +594,17 @@ def continue_pi_search_pool(
     worker_budget: dict[str, Any] | None = None,
     final_verify: bool = True,
 ) -> dict[str, Any]:
+    pool = _load_pool(root_dir, pool_id)
+    if pool.get("host") == "pi-thinkthread":
+        from goal_plus.thinkthread_pool import continue_pool
+
+        return continue_pool(
+            root_dir=root_dir,
+            pool_id=pool_id,
+            candidate_id=candidate_id,
+            worker_budget=worker_budget,
+            final_verify=final_verify,
+        )
     return _submit_pi_search_pool(
         root_dir=root_dir,
         pool_id=pool_id,
@@ -688,6 +713,16 @@ def snapshot_pi_search_pool(
                 if run_id is None or snapshot["run_id"] == run_id:
                     pools.append(snapshot)
         return {"run_id": run_id, "pools": pools}
+    raw_pool = _load_pool(root_dir, pool_id)
+    if raw_pool.get("host") == "pi-thinkthread":
+        from goal_plus.thinkthread_pool import snapshot_pool
+
+        snapshot = snapshot_pool(root_dir=root_dir, pool_id=pool_id)
+        if run_id is not None and snapshot["run_id"] != run_id:
+            raise ValueError(
+                f"Pi pool {pool_id} belongs to run {snapshot['run_id']}, not {run_id}"
+            )
+        return snapshot
     with exclusive_file_lock(_pool_lock_path(root_dir, pool_id)):
         pool = _load_pool(root_dir, pool_id)
         if run_id is not None and pool["run_id"] != run_id:
@@ -754,6 +789,27 @@ def wait_any_pi_search_pool(
 ) -> dict[str, Any]:
     if timeout_seconds < 0:
         raise ValueError("timeout_seconds must be >= 0")
+    pool = _load_pool(root_dir, pool_id)
+    if pool.get("host") == "pi-thinkthread":
+        from goal_plus.thinkthread_pool import wait_any
+
+        result = wait_any(
+            root_dir=root_dir,
+            pool_id=pool_id,
+            timeout_seconds=timeout_seconds,
+        )
+        snapshot = result["snapshot"]
+        event = result.get("event")
+        return {
+            "pool_id": pool_id,
+            "events": [event] if event is not None else [],
+            "timed_out": event is None and snapshot["active_count"] > 0,
+            "active_count": snapshot["active_count"],
+            "free_slots": max(
+                0, int(snapshot["max_parallel"]) - int(snapshot["active_count"])
+            ),
+            "state": snapshot["state"],
+        }
     deadline = time.monotonic() + timeout_seconds
     while True:
         with exclusive_file_lock(_pool_lock_path(root_dir, pool_id)):
@@ -822,6 +878,16 @@ def close_pi_search_pool(
         raise ValueError("mode must be 'drain' or 'interrupt'")
     if timeout_seconds < 0:
         raise ValueError("timeout_seconds must be >= 0")
+    pool = _load_pool(root_dir, pool_id)
+    if pool.get("host") == "pi-thinkthread":
+        from goal_plus.thinkthread_pool import close_pool
+
+        return close_pool(
+            root_dir=root_dir,
+            pool_id=pool_id,
+            mode=mode,
+            timeout_seconds=timeout_seconds,
+        )
     with exclusive_file_lock(_pool_lock_path(root_dir, pool_id)):
         pool = _load_pool(root_dir, pool_id)
         if pool["state"] == "closed":
