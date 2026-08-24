@@ -1458,3 +1458,247 @@ def test_spawn_completion_unknown_reconciles_by_registration_nonce_without_retry
 
 
 @pytest.mark.pi
+def test_exact_snapshot_verifier_uses_durable_fs_run_and_closes_after_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    monkeypatch.setenv("PATH", "/task-venv/bin:/usr/bin:/bin")
+    monkeypatch.setenv("VIRTUAL_ENV", "/task-venv")
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+
+    report = runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="test exact snapshot",
+    )
+
+    assert report.process_passed is True
+    assert report.aggregate_score == 1.5
+    assert report.disposition == "keep"
+    assert report.best_artifact_ref == FsSnapshotArtifactRef(
+        snapshot_id="fsnap-attempt"
+    )
+    assert len(client.run_params) == 1
+    invocation = client.run_params[0]
+    assert invocation["snapshotId"] == "fsnap-attempt"
+    assert invocation["writes"] == "discard"
+    assert invocation["invocation"]["argv"][1:3] == [
+        "-m",
+        "goal_plus.revision_verifier",
+    ]
+    assert invocation["invocation"]["environment"] == {
+        "PATH": "/task-venv/bin:/usr/bin:/bin",
+        "VIRTUAL_ENV": "/task-venv",
+    }
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert record.iterations[0].attempt_ref == FsSnapshotArtifactRef(
+        snapshot_id="fsnap-attempt"
+    )
+    assert record.iterations[0].changed_files == ["initial_program.py"]
+    assert record.settled_artifact_ref == FsSnapshotArtifactRef(
+        snapshot_id="fsnap-attempt"
+    )
+    run = runtime._load_run(run_id)
+    assert [request.operation for request in run.fs_requests] == [
+        "root_snapshot",
+        "branch_snapshot",
+        "run",
+    ]
+    assert all(request.state == "closed" for request in run.fs_requests)
+    assert all(request.result is not None for request in run.fs_requests)
+    assert record.iterations[0].verifier_request_ids == [
+        run.fs_requests[1].request_id,
+        run.fs_requests[2].request_id,
+    ]
+
+
+@pytest.mark.pi
+def test_branch_snapshot_completion_unknown_recovers_without_duplicate_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    client.branch_snapshot_completion_unknown_once = True
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+
+    report = runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="recover exact snapshot capture",
+    )
+
+    assert report.process_passed is True
+    run = runtime._load_run(run_id)
+    request = next(
+        item for item in run.fs_requests if item.operation == "branch_snapshot"
+    )
+    intent = runtime._load_candidate_record(
+        run_id, task.candidate_id
+    ).fs_snapshot_intents[0]
+    assert request.state == "closed"
+    assert intent.request_id == request.request_id
+    assert intent.snapshot_id == "fsnap-attempt"
+    assert [
+        params["requestId"]
+        for operation, params in client.operations
+        if operation == "fs.branch.snapshot"
+    ] == [request.request_id]
+    assert (
+        "fs.request.status",
+        {"requestId": request.request_id},
+    ) in client.operations
+
+
+@pytest.mark.pi
+def test_exact_snapshot_resource_lock_covers_execution_and_result_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    lock_active = False
+
+    @contextmanager
+    def fake_lock(_resource):
+        nonlocal lock_active
+        assert lock_active is False
+        lock_active = True
+        try:
+            yield
+        finally:
+            lock_active = False
+
+    original_parse = runtime._parse_metrics
+
+    def parse_while_locked(stdout: str):
+        assert lock_active is True
+        return original_parse(stdout)
+
+    monkeypatch.setattr("goal_plus.runtime.verifier_resource_lock", fake_lock)
+    monkeypatch.setattr(runtime, "_parse_metrics", parse_while_locked)
+
+    report = runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="prove the verifier lock includes parsing",
+    )
+
+    assert report.process_passed is True
+    assert lock_active is False
+
+
+@pytest.mark.pi
+@pytest.mark.parametrize(
+    ("exit_status", "truncated", "failure_class"),
+    [
+        ({"kind": "code", "code": 7}, False, "VerifierCommandFailed"),
+        ({"kind": "signal", "signal": 9}, False, "VerifierSignal"),
+        ({"kind": "timeout"}, False, "Timeout"),
+        ({"kind": "cancelled"}, False, "VerifierCancelled"),
+        ({"kind": "killed"}, False, "VerifierKilled"),
+        ({"kind": "code", "code": 0}, True, "VerifierInfrastructureFailure"),
+    ],
+)
+def test_exact_snapshot_verifier_normalizes_all_terminal_exits_and_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_status: dict,
+    truncated: bool,
+    failure_class: str,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    payload = json.dumps({"combined_score": 1.5}) + "\n"
+    client.run_result_override = {
+        "exit": exit_status,
+        "outputChunks": [
+            {
+                "sequence": 0,
+                "stream": "stdout",
+                "dataBase64": base64.b64encode(payload.encode()).decode("ascii"),
+            }
+        ],
+        "outputTruncated": truncated,
+        "retainedOutputBytes": len(payload),
+        "observedOutputBytes": len(payload),
+        "runKey": "run-key-terminal",
+        "metrics": {},
+    }
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+
+    report = runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="normalize an exact verifier terminal exit",
+    )
+
+    assert report.process_passed is False
+    assert report.verifier_results[0].failure_class == failure_class
+    if truncated:
+        assert report.verifier_results[0].metrics["infrastructure_failure"] is True
+    request = runtime._load_run(run_id).fs_requests[-1]
+    assert request.operation == "run"
+    assert request.state == "closed"
+
+
+@pytest.mark.pi
