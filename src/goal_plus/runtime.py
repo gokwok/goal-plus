@@ -4175,6 +4175,191 @@ class FileSearchRuntime:
             state = str(latest.state)
         return {"state": state, "resolved": resolved, "failed": failed}
 
+    def _capture_pi_thinkthread_attempt(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        session: AgentSessionRecord,
+        idempotency_key: str | None = None,
+    ) -> _FsAttemptState:
+        branch_id = record.task.fs_branch_id
+        if not branch_id:
+            raise RuntimeError("pi-thinkthread candidate has no bound fs branch")
+        child_id = session.host_handle.external_id
+        execution_state_before: str | None = None
+        if child_id:
+            try:
+                child_before = client.invoke("thinkthread.get", {"id": child_id})
+            except AgentPosixBridgeError:
+                pass
+            else:
+                raw_execution_state = child_before.get("executionState")
+                if isinstance(raw_execution_state, str):
+                    execution_state_before = raw_execution_state
+        base_ref = self._fs_snapshot_ref(
+            record.settled_artifact_ref or run.baseline_artifact_ref,
+            field="candidate settled artifact",
+        )
+        request_id, snapshot_id = self.capture_pi_thinkthread_branch_snapshot(
+            run_id=run.run_id,
+            candidate_id=record.candidate_id,
+            branch_id=branch_id,
+            purpose=(
+                f"candidate {record.candidate_id} verifier iteration "
+                f"{len(record.iterations) + 1}"
+            ),
+            client=client,
+            intent_id=(
+                f"rpc-verifier-{idempotency_key}"
+                if idempotency_key is not None
+                else None
+            ),
+        )
+        attempt_ref = FsSnapshotArtifactRef(snapshot_id=snapshot_id)
+
+        continuation_required = False
+        if child_id:
+            try:
+                child = client.invoke(
+                    "thinkthread.get",
+                    {"id": child_id},
+                )
+            except AgentPosixBridgeError:
+                continuation_required = execution_state_before in {None, "running"}
+            else:
+                continuation_required = bool(
+                    execution_state_before in {None, "running"}
+                    and child.get("executionState") != "running"
+                )
+            if continuation_required:
+                latest_session = self._load_agent_session_by_id(
+                    session.agent_session_id,
+                    run_id=run.run_id,
+                )
+                metadata = dict(latest_session.host_handle.metadata)
+                metadata.update(
+                    {
+                        "continuation_state": "needs_recovery",
+                        "continuation_snapshot_id": snapshot_id,
+                    }
+                )
+                latest_session.host_handle.metadata = metadata
+                latest_session.updated_at = utc_timestamp()
+                self._write_agent_session(latest_session)
+
+        reader = FsSnapshotArtifactReader(client)
+        baseline_ref = self._fs_snapshot_ref(
+            run.baseline_artifact_ref,
+            field="run baseline",
+        )
+        source_prefix = run.fs_source_relative_path or "."
+        changed_root_paths = reader.changed_files(base_ref, attempt_ref)
+        changed_files = [
+            self._fs_source_projected_path(source_prefix, path)
+            for path in changed_root_paths
+        ]
+        touched_denied = any(
+            path_matches(path, frozen.spec.edit_surface.deny)
+            for path in changed_files
+        )
+        outside_allowed = any(
+            not path_matches(path, frozen.spec.edit_surface.allow)
+            for path in changed_files
+        )
+        if (
+            frozen.spec.edit_surface.max_file_changes is not None
+            and len(changed_files) > frozen.spec.edit_surface.max_file_changes
+        ):
+            outside_allowed = True
+        return _FsAttemptState(
+            base_ref=base_ref,
+            attempt_ref=attempt_ref,
+            changed_files=changed_files,
+            actual_diff=reader.diff(
+                base_ref,
+                attempt_ref,
+                max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+            ),
+            cumulative_diff=reader.diff(
+                baseline_ref,
+                attempt_ref,
+                max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+            ),
+            touched_denied_files=touched_denied,
+            changed_outside_allowed=outside_allowed,
+            artifact_hash=reader.canonical_digest(baseline_ref, attempt_ref),
+            continuation_required=continuation_required,
+            snapshot_request_id=request_id,
+        )
+
+    @staticmethod
+    def _fs_iteration_eligible(iteration: IterationRecord) -> bool:
+        return bool(
+            iteration.process_passed is True
+            and iteration.score is not None
+            and math.isfinite(iteration.score)
+            and isinstance(iteration.attempt_ref, FsSnapshotArtifactRef)
+            and not iteration.touched_denied_files
+            and not iteration.changed_outside_allowed
+        )
+
+    @classmethod
+    def _fs_iteration_disposition(
+        cls,
+        iteration: IterationRecord,
+        prior_best: IterationRecord | None,
+        metric_direction: Literal["maximize", "minimize"],
+    ) -> IterationDisposition:
+        if not cls._fs_iteration_eligible(iteration):
+            return "failure"
+        if prior_best is None:
+            return "keep"
+        assert iteration.score is not None and prior_best.score is not None
+        improved = (
+            iteration.score > prior_best.score
+            if metric_direction == "maximize"
+            else iteration.score < prior_best.score
+        )
+        if improved:
+            return "keep"
+        if iteration.score == prior_best.score:
+            return "retain"
+        return "discard"
+
+    def _write_best_fs_artifact(
+        self,
+        run: RunRecord,
+        spec: SearchSpec,
+        record: CandidateRecord,
+        iteration: IterationRecord,
+    ) -> None:
+        artifact = self._fs_snapshot_ref(
+            iteration.attempt_ref,
+            field="best iteration",
+        )
+        if iteration.artifact_hash is None or iteration.score is None:
+            raise RuntimeError("run best FsSnapshot iteration is incomplete")
+        best = BestArtifactRecord(
+            schema_version=2,
+            run_id=run.run_id,
+            candidate_id=record.candidate_id,
+            iteration=iteration.iteration,
+            artifact_ref=artifact,
+            score=iteration.score,
+            metric_name=spec.metric_name,
+            metric_direction=spec.metric_direction,
+            artifact_hash=iteration.artifact_hash,
+            changed_files=iteration.changed_files,
+            updated_at=iteration.created_at,
+        )
+        write_json(
+            self._run_dir(run.run_id) / "best.json",
+            best.model_dump(mode="json"),
+        )
+
     def _settle_process_verifier(
         self,
         *,
