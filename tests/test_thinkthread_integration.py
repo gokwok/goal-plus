@@ -1267,3 +1267,194 @@ def test_pool_settles_completed_wake_while_retained_runtime_stays_running(
 
 
 @pytest.mark.pi
+def test_turn_boundary_final_verifier_stops_resident_runtime_before_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [2.0]
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    pool = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    job = _load_job(
+        runtime.root_dir,
+        pool["pool_id"],
+        pool["jobs"][0]["job_id"],
+    )
+    child = client._child(job["thinkthread_id"])
+    child.update(
+        {
+            "agentState": "ready",
+            "executionState": "running",
+            "pendingWake": False,
+            "lastWakeOutcome": {
+                "messageId": job["active_message_id"],
+                "outcome": "completed",
+                "finishedAtUnixMs": 1,
+            },
+        }
+    )
+
+    completed = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool["pool_id"],
+        timeout_seconds=1,
+        client=client,
+    )
+
+    assert completed["event"]["kind"] == "candidate_ready"
+    job = _load_job(
+        runtime.root_dir,
+        pool["pool_id"],
+        pool["jobs"][0]["job_id"],
+    )
+    assert job["final_verifier"]["process_passed"] is True
+    assert job["final_verifier_boundary"]["state"] == "settled"
+    ordered = [
+        operation
+        for operation, _params in client.operations
+        if operation
+        in {"thinkthread.signal", "thinkthread.wait", "fs.branch.snapshot"}
+    ]
+    assert ordered[-3:] == [
+        "thinkthread.signal",
+        "thinkthread.wait",
+        "fs.branch.snapshot",
+    ]
+
+
+@pytest.mark.pi
+def test_successor_start_batch_ignores_legacy_git_ledger_for_fs_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    first_run_id = runtime.create_run(frozen.frozen_spec_id)
+    first_plan = runtime.plan_next(first_run_id, requested_k=1)
+    first_task = runtime.start_batch(first_run_id, first_plan.plan_id)[0]
+    assert first_task.workspace is None
+
+    runtime.invalidate_run(
+        first_run_id,
+        reason="verifier_infrastructure_failure",
+        summary="worker dispatch was interrupted before session creation",
+        evidence=[{"stage": "pool_open"}],
+    )
+    successor_id = runtime.create_run(
+        frozen.frozen_spec_id,
+        source_run_id=first_run_id,
+    )
+    successor_plan = runtime.plan_next(successor_id, requested_k=1)
+    successor = runtime.start_batch(successor_id, successor_plan.plan_id)[0]
+
+    assert successor.workspace is None
+    record = runtime._load_candidate_record(successor_id, successor.candidate_id)
+    assert record.results_ledger == []
+
+
+@pytest.mark.pi
+def test_pool_rejects_exhausted_durable_request_quota_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    client.storage_override.update({"requestCount": 1024, "requestLimit": 1024})
+
+    with pytest.raises(RuntimeError, match="durable request quota is exhausted"):
+        open_pool(
+            root_dir=runtime.root_dir,
+            run_id=run_id,
+            candidate_ids=[task.candidate_id],
+            client=client,
+        )
+
+    assert client.spawn_params == []
+
+
+@pytest.mark.pi
+def test_spawn_completion_unknown_reconciles_by_registration_nonce_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.spawn_completion_unknown_once = True
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+
+    pool = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    job_id = pool["jobs"][0]["job_id"]
+    job = _load_job(runtime.root_dir, pool["pool_id"], job_id)
+    assert job["status"] == "needs_recovery"
+    # Reproduce a hard controller exit after platform admission but before the
+    # exception/result was persisted.
+    job["status"] = "starting"
+    job["spawn_intent"]["state"] = "platform_mutation_started"
+    _write_job(runtime.root_dir, pool["pool_id"], job)
+    child_id = client.children[0]["thinkthreadId"]
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+
+    reconciled = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool["pool_id"],
+        timeout_seconds=0,
+        client=client,
+    )
+
+    assert reconciled["event"] is None
+    job = _load_job(runtime.root_dir, pool["pool_id"], job_id)
+    assert job["status"] == "running"
+    assert job["thinkthread_id"] == child_id
+    assert job["spawn_intent"]["state"] == "bound_after_recovery"
+    assert len(client.spawn_params) == 1
+
+
+@pytest.mark.pi
