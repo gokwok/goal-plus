@@ -1934,3 +1934,251 @@ def _recoverable_final_verifier_stop(job: dict[str, Any]) -> bool:
         and boundary.get("state")
         in {"prepared", "stop_needs_recovery", "platform_mutation_started"}
     )
+
+
+def _wait_any_owned(
+    *,
+    root_dir: Path | str,
+    pool_id: str,
+    timeout_seconds: float = 30.0,
+    client: AgentPosixSdkClient | None = None,
+) -> dict[str, Any]:
+    if timeout_seconds < 0:
+        raise ValueError("pi-thinkthread wait timeout_seconds must be non-negative")
+    sdk = client or AgentPosixSdkClient()
+    deadline = time.monotonic() + timeout_seconds
+    runtime = FileSearchRuntime(root_dir)
+    while True:
+        with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+            pool = _load_pool(root_dir, pool_id)
+            jobs = _jobs(root_dir, pool)
+        for job in jobs:
+            if _normalize_interrupted_platform_mutation(job):
+                _write_job(root_dir, pool_id, job)
+            if job.get("status") in TERMINAL_STATES and not job.get("delivered_at"):
+                job["delivered_at"] = utc_timestamp()
+                _write_job(root_dir, pool_id, job)
+                return {"event": _event(pool, job), "snapshot": snapshot_pool(root_dir=root_dir, pool_id=pool_id)}
+            if job.get("status") == "needs_recovery":
+                try:
+                    _recover_spawn_binding(runtime, sdk, root_dir, pool, job)
+                    if job.get("status") == "needs_recovery":
+                        _recover_wake_binding(runtime, sdk, root_dir, job)
+                except AgentPosixBridgeError as exc:
+                    job["error"] = {
+                        "stage": "spawn_recovery",
+                        "message": str(exc),
+                        "error_code": exc.code,
+                        "completion_unknown": exc.completion_unknown,
+                    }
+                    _write_job(root_dir, pool_id, job)
+                if (
+                    job.get("status") == "needs_recovery"
+                    and (
+                        _recoverable_restore_pending(job)
+                        or _recoverable_final_verifier_stop(job)
+                        or (
+                            isinstance(job.get("error"), dict)
+                            and job["error"].get("stage") == "worker_rpc"
+                            and any(
+                                isinstance(item, dict)
+                                and item.get("state") == "needs_recovery"
+                                for item in job.get("request_intents", {}).values()
+                            )
+                        )
+                    )
+                ):
+                    job["status"] = "running"
+                    job["error"] = None
+                    job["restore_recovery_resumed_at"] = utc_timestamp()
+                    _write_job(root_dir, pool_id, job)
+                if job.get("status") == "needs_recovery":
+                    continue
+            if job.get("status") != "running":
+                continue
+            try:
+                _receive_job_messages(runtime, sdk, root_dir, job)
+                deadline_exceeded = time.time() >= _lease_deadline_epoch(job)
+                if deadline_exceeded:
+                    job["deadline_exceeded_at"] = utc_timestamp()
+                    if not _stop_child_for_deadline(sdk, job):
+                        job["status"] = "needs_recovery"
+                        job["error"] = {
+                            "stage": "deadline",
+                            "message": "ThinkThread Child remained active after INT/TERM",
+                        }
+                        _write_job(root_dir, pool_id, job)
+                        continue
+                child = sdk.invoke("thinkthread.get", {"id": job["thinkthread_id"]})
+            except _WorkerRpcNeedsRecovery:
+                continue
+            except AgentPosixBridgeError as exc:
+                if exc.code == "ThinkThreadNotFound":
+                    job["status"] = "failed"
+                    job["error"] = {"stage": "wait", "message": str(exc), "error_code": exc.code}
+                    _write_job(root_dir, pool_id, job)
+                continue
+            turn_outcome = _terminal_turn_outcome(job, child)
+            if turn_outcome is not None:
+                pending_responses = job.get("pending_responses")
+                if isinstance(pending_responses, dict) and pending_responses:
+                    for request_id in list(pending_responses):
+                        settled = job.setdefault("settled_requests", {}).get(request_id)
+                        if isinstance(settled, dict):
+                            settled["response_ack_inferred_at_turn_end"] = utc_timestamp()
+                    pending_responses.clear()
+                    _write_job(root_dir, pool_id, job)
+                try:
+                    copied = _apply_job_tool_copies(
+                        runtime,
+                        sdk,
+                        root_dir,
+                        pool_id,
+                        job,
+                    )
+                    if not copied:
+                        job["status"] = "needs_recovery"
+                        _write_job(root_dir, pool_id, job)
+                        continue
+                    restored = _restore_job_branch(
+                        runtime,
+                        sdk,
+                        root_dir,
+                        pool_id,
+                        job,
+                    )
+                except (AgentPosixBridgeError, RuntimeError) as exc:
+                    copy_failed = any(
+                        isinstance(item, dict) and item.get("state") == "failed"
+                        for item in job.get("copy_requirements", [])
+                    )
+                    job["status"] = "failed" if copy_failed else "needs_recovery"
+                    if copy_failed:
+                        job["finished_at"] = utc_timestamp()
+                    job["error"] = {
+                        "stage": "restore",
+                        "message": str(exc),
+                        "error_code": (
+                            exc.code if isinstance(exc, AgentPosixBridgeError) else None
+                        ),
+                    }
+                    _write_job(root_dir, pool_id, job)
+                    continue
+                if not restored:
+                    job["status"] = "needs_recovery"
+                    _write_job(root_dir, pool_id, job)
+                    continue
+                completion = child.get("completion")
+                job["completion"] = completion
+                job["wake_outcome"] = turn_outcome
+                if deadline_exceeded:
+                    job["status"] = "timed_out"
+                    job["finished_at"] = utc_timestamp()
+                    _write_job(root_dir, pool_id, job)
+                    continue
+                if (
+                    child.get("agentState") != "ready"
+                    or turn_outcome.get("outcome") != "completed"
+                ):
+                    job["status"] = "failed"
+                    job["finished_at"] = utc_timestamp()
+                    _write_job(root_dir, pool_id, job)
+                    continue
+                if isinstance(job.get("turn_boundary_wake_required"), dict):
+                    try:
+                        _wake_after_turn_boundary(
+                            runtime=runtime,
+                            sdk=sdk,
+                            root_dir=root_dir,
+                            pool_id=pool_id,
+                            job=job,
+                        )
+                    except (AgentPosixBridgeError, RuntimeError) as exc:
+                        job["status"] = (
+                            "needs_recovery"
+                            if isinstance(exc, AgentPosixBridgeError)
+                            and exc.completion_unknown
+                            else "failed"
+                        )
+                        job["error"] = {
+                            "stage": "turn_boundary_wake",
+                            "message": str(exc),
+                            "error_code": (
+                                exc.code
+                                if isinstance(exc, AgentPosixBridgeError)
+                                else None
+                            ),
+                        }
+                        _write_job(root_dir, pool_id, job)
+                    continue
+                if job.get("final_verify") is True:
+                    try:
+                        _run_turn_boundary_final_verifier(
+                            runtime,
+                            sdk,
+                            root_dir,
+                            pool_id,
+                            job,
+                        )
+                        _write_job(root_dir, pool_id, job)
+                        if isinstance(
+                            job.get("turn_boundary_wake_required"), dict
+                        ):
+                            if not _restore_job_branch(
+                                runtime,
+                                sdk,
+                                root_dir,
+                                pool_id,
+                                job,
+                            ):
+                                job["status"] = "needs_recovery"
+                                _write_job(root_dir, pool_id, job)
+                                continue
+                            _wake_after_turn_boundary(
+                                runtime=runtime,
+                                sdk=sdk,
+                                root_dir=root_dir,
+                                pool_id=pool_id,
+                                job=job,
+                            )
+                            continue
+                    except (AgentPosixBridgeError, RuntimeError) as exc:
+                        job["status"] = "needs_recovery"
+                        job["error"] = {
+                            "stage": "final_verifier",
+                            "message": str(exc),
+                            "error_code": (
+                                exc.code
+                                if isinstance(exc, AgentPosixBridgeError)
+                                else None
+                            ),
+                        }
+                        _write_job(root_dir, pool_id, job)
+                        continue
+                if not _lease_satisfied(job):
+                    try:
+                        _wake_for_minimum_lease(
+                            runtime,
+                            sdk,
+                            root_dir,
+                            pool_id,
+                            job,
+                        )
+                    except AgentPosixBridgeError as exc:
+                        job["status"] = (
+                            "needs_recovery" if exc.completion_unknown else "failed"
+                        )
+                        job["error"] = {
+                            "stage": "lease_wake",
+                            "message": str(exc),
+                            "error_code": exc.code,
+                            "completion_unknown": exc.completion_unknown,
+                        }
+                        _write_job(root_dir, pool_id, job)
+                    continue
+                job["status"] = "completed"
+                job["finished_at"] = utc_timestamp()
+                _write_job(root_dir, pool_id, job)
+        if time.monotonic() >= deadline:
+            return {"event": None, "snapshot": snapshot_pool(root_dir=root_dir, pool_id=pool_id)}
+        time.sleep(0.1)
