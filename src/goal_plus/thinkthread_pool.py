@@ -2354,3 +2354,252 @@ def snapshot_pool(*, root_dir: Path | str, pool_id: str) -> dict[str, Any]:
             for job in jobs
         ],
     }
+
+
+def _close_pool_owned(
+    *,
+    root_dir: Path | str,
+    pool_id: str,
+    mode: Literal["drain", "interrupt"] = "drain",
+    timeout_seconds: float = 30.0,
+    client: AgentPosixSdkClient | None = None,
+) -> dict[str, Any]:
+    if mode not in {"drain", "interrupt"}:
+        raise ValueError("pi-thinkthread close mode must be drain or interrupt")
+    if timeout_seconds < 0:
+        raise ValueError("pi-thinkthread close timeout_seconds must be non-negative")
+    sdk = client or AgentPosixSdkClient()
+    runtime = FileSearchRuntime(root_dir)
+    already_closed = False
+    with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+        pool = _load_pool(root_dir, pool_id)
+        jobs = _jobs(root_dir, pool)
+        if pool.get("state") == "closed":
+            already_closed = True
+        active_jobs = [
+            job for job in jobs if job.get("status") in ACTIVE_STATES
+        ]
+        if not already_closed and mode == "drain" and active_jobs:
+            raise RuntimeError(
+                f"cannot drain pi-thinkthread pool {pool_id} with "
+                f"{len(active_jobs)} active job(s); continue wait_any or use interrupt"
+            )
+        if not already_closed:
+            pool["state"] = "closing"
+            pool.setdefault("cleanup", [])
+            _write_pool(root_dir, pool)
+    if already_closed:
+        return snapshot_pool(root_dir=root_dir, pool_id=pool_id)
+
+    for job in jobs:
+        if job.get("status") != "needs_recovery":
+            continue
+        try:
+            _recover_spawn_binding(runtime, sdk, root_dir, pool, job)
+            if job.get("status") == "needs_recovery":
+                _recover_wake_binding(runtime, sdk, root_dir, job)
+        except AgentPosixBridgeError as exc:
+            job["error"] = {
+                "stage": "close_recovery",
+                "message": str(exc),
+                "error_code": exc.code,
+                "completion_unknown": exc.completion_unknown,
+            }
+            _write_job(root_dir, pool_id, job)
+
+    cleanup: list[dict[str, Any]] = []
+    unique_children: dict[str, str | None] = {}
+    for job in jobs:
+        child = job.get("thinkthread_id")
+        if isinstance(child, str):
+            unique_children[child] = job.get("fs_branch_id")
+    for child_id, branch_id in unique_children.items():
+        record: dict[str, Any] = {
+            "thinkthread_id": child_id,
+            "fs_branch_id": branch_id,
+            "status": "prepared",
+            "prepared_at": utc_timestamp(),
+        }
+        cleanup.append(record)
+        with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+            latest_pool = _load_pool(root_dir, pool_id)
+            latest_pool["cleanup"] = cleanup
+            _write_pool(root_dir, latest_pool)
+        try:
+            child = sdk.invoke("thinkthread.get", {"id": child_id})
+            if child.get("executionState") != "absent":
+                record["status"] = "stopping_execution"
+                record["stopping_started_at"] = utc_timestamp()
+                with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+                    latest_pool = _load_pool(root_dir, pool_id)
+                    latest_pool["cleanup"] = cleanup
+                    _write_pool(root_dir, latest_pool)
+                sdk.invoke("thinkthread.signal", {"id": child_id, "signal": "INT"})
+                waited_child = _wait_for_execution_absent(
+                    sdk,
+                    child_id,
+                    timeout_seconds,
+                )
+                if waited_child is None:
+                    sdk.invoke(
+                        "thinkthread.signal", {"id": child_id, "signal": "TERM"}
+                    )
+                    waited_child = _wait_for_execution_absent(
+                        sdk,
+                        child_id,
+                        timeout_seconds,
+                    )
+                if waited_child is None:
+                    raise RuntimeError(
+                        f"ThinkThread Child {child_id} execution remained active"
+                    )
+            if isinstance(branch_id, str):
+                branch = sdk.invoke("fs.branch.stat", {"branchId": branch_id})
+                if branch.get("state") != "removed":
+                    generation = branch.get("controlGeneration")
+                    if not isinstance(generation, int):
+                        raise RuntimeError("fs.branch.stat omitted controlGeneration")
+                    record["status"] = "removing_branch"
+                    record["branch_generation"] = generation
+                    with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+                        latest_pool = _load_pool(root_dir, pool_id)
+                        latest_pool["cleanup"] = cleanup
+                        _write_pool(root_dir, latest_pool)
+                    try:
+                        sdk.invoke(
+                            "fs.branch.remove",
+                            {
+                                "branchId": branch_id,
+                                "ifGeneration": generation,
+                            },
+                        )
+                    except AgentPosixBridgeError as exc:
+                        if not exc.completion_unknown:
+                            raise
+                        observed = sdk.invoke(
+                            "fs.branch.stat", {"branchId": branch_id}
+                        )
+                        if observed.get("state") != "removed":
+                            raise
+            record["status"] = "destroying_child"
+            with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+                latest_pool = _load_pool(root_dir, pool_id)
+                latest_pool["cleanup"] = cleanup
+                _write_pool(root_dir, latest_pool)
+            try:
+                sdk.invoke("thinkthread.destroy", {"id": child_id})
+            except AgentPosixBridgeError as exc:
+                if not exc.completion_unknown:
+                    raise
+                try:
+                    sdk.invoke("thinkthread.get", {"id": child_id})
+                except AgentPosixBridgeError as observed:
+                    if observed.code != "ThinkThreadNotFound":
+                        raise exc
+                else:
+                    raise exc
+            record["status"] = "removed"
+            record["removed_at"] = utc_timestamp()
+        except AgentPosixBridgeError as exc:
+            if exc.code in {"ThinkThreadNotFound", "FsBranchNotFound"}:
+                record["status"] = "already_removed"
+            else:
+                record.update(
+                    {
+                        "status": "needs_recovery" if exc.completion_unknown else "failed",
+                        "error_code": exc.code,
+                        "message": str(exc),
+                    }
+                )
+        except RuntimeError as exc:
+            record.update(
+                {
+                    "status": "failed",
+                    "message": str(exc),
+                }
+            )
+        with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+            latest_pool = _load_pool(root_dir, pool_id)
+            latest_pool["cleanup"] = cleanup
+            _write_pool(root_dir, latest_pool)
+
+    for job in jobs:
+        if job.get("status") not in ACTIVE_STATES:
+            continue
+        job["status"] = "interrupted"
+        job["finished_at"] = utc_timestamp()
+        job["error"] = job.get("error") or {
+            "stage": "pool_close",
+            "message": f"pool closed with mode={mode}",
+        }
+        _write_job(root_dir, pool_id, job)
+
+    unbound_unknown = [
+        job["job_id"]
+        for job in jobs
+        if not isinstance(job.get("thinkthread_id"), str)
+        and isinstance(job.get("spawn_intent"), dict)
+        and job["spawn_intent"].get("state") == "outcome_unknown"
+    ]
+    remaining_children: list[str] = []
+    try:
+        listed = sdk.invoke("thinkthread.list").get("children")
+        if isinstance(listed, list):
+            pool_children = set(unique_children)
+            remaining_children = sorted(
+                str(child["thinkthreadId"])
+                for child in listed
+                if isinstance(child, dict)
+                and child.get("thinkthreadId") in pool_children
+            )
+        storage = sdk.invoke("fs.stat").get("storage")
+    except AgentPosixBridgeError as exc:
+        remaining_children = [f"observation_failed:{exc}"]
+        storage = None
+    with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+        pool = _load_pool(root_dir, pool_id)
+        pool["state"] = (
+            "needs_recovery"
+            if (
+                any(
+                    item["status"] in {"needs_recovery", "failed"}
+                    for item in cleanup
+                )
+                or remaining_children
+                or unbound_unknown
+            )
+            else "closed"
+        )
+        pool["cleanup"] = cleanup
+        pool["cleanup_observation"] = {
+            "remaining_pool_children": remaining_children,
+            "unbound_unknown_jobs": unbound_unknown,
+            "storage": storage,
+            "observed_at": utc_timestamp(),
+        }
+        _write_pool(root_dir, pool)
+    return snapshot_pool(root_dir=root_dir, pool_id=pool_id)
+
+
+def close_pool(
+    *,
+    root_dir: Path | str,
+    pool_id: str,
+    mode: Literal["drain", "interrupt"] = "drain",
+    timeout_seconds: float = 30.0,
+    client: AgentPosixSdkClient | None = None,
+) -> dict[str, Any]:
+    with _TryControllerLock(
+        _controller_lock_path(root_dir, pool_id)
+    ) as acquired:
+        if not acquired:
+            raise RuntimeError(
+                f"pi-thinkthread pool {pool_id} controller is busy"
+            )
+        return _close_pool_owned(
+            root_dir=root_dir,
+            pool_id=pool_id,
+            mode=mode,
+            timeout_seconds=timeout_seconds,
+            client=client,
+        )
