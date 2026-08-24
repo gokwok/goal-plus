@@ -3265,6 +3265,135 @@ class FileSearchRuntime:
         )
         return result
 
+    def _invoke_durable_fs_run(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        run_id: str,
+        request_id: str,
+        params: dict[str, Any],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        return self._invoke_durable_fs_operation(
+            client=client,
+            run_id=run_id,
+            request_id=request_id,
+            method="fs.run",
+            params=params,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @staticmethod
+    def _decode_fs_run_output(result: dict[str, Any]) -> tuple[str, str]:
+        chunks = result.get("outputChunks")
+        if not isinstance(chunks, list):
+            raise ValueError("fs.run omitted outputChunks")
+        ordered: list[tuple[int, str, bytes]] = []
+        seen: set[int] = set()
+        for raw in chunks:
+            if not isinstance(raw, dict):
+                raise ValueError("fs.run output chunk is not an object")
+            sequence = raw.get("sequence")
+            stream = raw.get("stream")
+            encoded = raw.get("dataBase64")
+            if (
+                not isinstance(sequence, int)
+                or sequence < 0
+                or sequence in seen
+                or stream not in {"stdout", "stderr"}
+                or not isinstance(encoded, str)
+            ):
+                raise ValueError("fs.run returned an invalid output chunk")
+            seen.add(sequence)
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise ValueError("fs.run returned invalid output base64") from exc
+            ordered.append((sequence, stream, data))
+        ordered.sort(key=lambda item: item[0])
+        stdout = b"".join(data for _, stream, data in ordered if stream == "stdout")
+        stderr = b"".join(data for _, stream, data in ordered if stream == "stderr")
+        return (
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+        )
+
+    @staticmethod
+    def _fs_exit_status(result: dict[str, Any]) -> tuple[int | None, str | None]:
+        exit_status = result.get("exit")
+        if not isinstance(exit_status, dict):
+            return None, "VerifierInfrastructureFailure"
+        kind = exit_status.get("kind")
+        if kind == "code" and isinstance(exit_status.get("code"), int):
+            return int(exit_status["code"]), None
+        if kind == "signal" and isinstance(exit_status.get("signal"), int):
+            return -int(exit_status["signal"]), "VerifierSignal"
+        return {
+            "timeout": (None, "Timeout"),
+            "killed": (None, "VerifierKilled"),
+            "cancelled": (None, "VerifierCancelled"),
+        }.get(str(kind), (None, "VerifierInfrastructureFailure"))
+
+    def _fs_internal_verifier(
+        self,
+        *,
+        reader: FsSnapshotArtifactReader,
+        artifact: FsSnapshotArtifactRef,
+        source_prefix: str,
+        frozen: FrozenSpec,
+        command: VerifierCommand,
+    ) -> VerifierResult:
+        if len(command.command) < 2 or command.command[1] != "check-frozen-hashes":
+            return VerifierResult(
+                name=command.name,
+                role=command.role,
+                passed=False,
+                score=0.0,
+                metrics={"error": "unknown internal command"},
+                failure_class="UnknownInternalCommand",
+            )
+        failures = self._fs_frozen_hash_failures(
+            reader=reader,
+            artifact=artifact,
+            source_prefix=source_prefix,
+            frozen=frozen,
+        )
+        return VerifierResult(
+            name=command.name,
+            role=command.role,
+            passed=not failures,
+            score=1.0 if not failures else 0.0,
+            metrics={"hash_failures": failures},
+            failure_class=None if not failures else "FrozenVerifierModified",
+        )
+
+    def _fs_frozen_hash_failures(
+        self,
+        *,
+        reader: FsSnapshotArtifactReader,
+        artifact: FsSnapshotArtifactRef,
+        source_prefix: str,
+        frozen: FrozenSpec,
+    ) -> dict[str, dict[str, str | None]]:
+        failures: dict[str, dict[str, str | None]] = {}
+        for relative_path, expected in frozen.verifier_hashes.items():
+            try:
+                data = reader.read_file(
+                    artifact,
+                    self._fs_join_path(source_prefix, relative_path),
+                    max_bytes=64 * 1024 * 1024,
+                )
+            except (AgentPosixBridgeError, ValueError):
+                actual = None
+            else:
+                actual = hashlib.sha256(data).hexdigest()
+            if actual != expected:
+                failures[relative_path] = {
+                    "expected": expected,
+                    "actual": actual,
+                }
+        return failures
+
     def _settle_process_verifier(
         self,
         *,
