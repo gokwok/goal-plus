@@ -7229,6 +7229,49 @@ class FileSearchRuntime:
             client=client,
         )
 
+    def _commit_pi_thinkthread_publication(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        baseline: FsSnapshotArtifactRef,
+        selected: FsSnapshotArtifactRef,
+        request_id: str,
+        outcome: dict[str, Any] | None,
+        client: AgentPosixSdkClient,
+    ) -> Path:
+        manifest = {
+            "status": "committed",
+            "candidate_id": candidate_id,
+            "base_artifact_ref": baseline.model_dump(mode="json"),
+            "target_artifact_ref": selected.model_dump(mode="json"),
+            "request_id": request_id,
+            "platform_result": outcome,
+            "committed_at": utc_timestamp(),
+        }
+        manifest_path = (
+            self._run_dir(run_id)
+            / "promotion"
+            / f"{candidate_id}.publication.json"
+        )
+        with self._run_transaction(run_id):
+            latest = self._load_run(run_id)
+            assert latest.publication is not None
+            latest.publication.state = "committed"
+            latest.publication.manifest = manifest
+            latest.publication.updated_at = utc_timestamp()
+            latest.state = RunState.PROMOTED
+            latest.selected_candidate_id = candidate_id
+            latest.budget_used.pop("needs_recovery_reason", None)
+            latest.budget_used.pop("publication_conflict", None)
+            write_json(manifest_path, manifest)
+            self._write_run(latest)
+        self._close_fs_requests_after_evidence(run_id, [request_id], client)
+        report_path = self._run_dir(run_id) / "report.md"
+        if report_path.exists() and not self._blocking_goal_report_records(run_id):
+            self.report(run_id)
+        return manifest_path
+
     def _strategy_mode(self, strategy: StrategySpec) -> str:
         return strategy.name.strip().lower().replace("-", "_")
 
