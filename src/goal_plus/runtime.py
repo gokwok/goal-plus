@@ -4360,6 +4360,159 @@ class FileSearchRuntime:
             best.model_dump(mode="json"),
         )
 
+    def _close_fs_requests_after_evidence(
+        self,
+        run_id: str,
+        request_ids: list[str],
+        client: AgentPosixSdkClient,
+    ) -> None:
+        self._retry_pending_fs_request_closes(run_id, client)
+        for request_id in request_ids:
+            try:
+                client.invoke("fs.request.close", {"requestId": request_id})
+            except AgentPosixBridgeError as exc:
+                if exc.code == "RequestNotFound":
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="closed",
+                        closed_at=utc_timestamp(),
+                    )
+                    continue
+                with self._run_transaction(run_id):
+                    run = self._load_run(run_id)
+                    pending = next(
+                        (
+                            item
+                            for item in reversed(run.fs_cleanup)
+                            if item.get("kind") == "request_close"
+                            and item.get("request_id") == request_id
+                            and item.get("state") == "needs_recovery"
+                        ),
+                        None,
+                    )
+                    if pending is None:
+                        pending = {
+                            "kind": "request_close",
+                            "state": "needs_recovery",
+                            "request_id": request_id,
+                            "created_at": utc_timestamp(),
+                        }
+                        run.fs_cleanup.append(pending)
+                    pending["error"] = str(exc)
+                    pending["updated_at"] = utc_timestamp()
+                    pending["attempts"] = int(pending.get("attempts", 0)) + 1
+                    self._write_run(run)
+                continue
+            self._update_fs_request(
+                run_id,
+                request_id,
+                state="closed",
+                closed_at=utc_timestamp(),
+            )
+
+    def _retry_pending_fs_request_closes(
+        self,
+        run_id: str,
+        client: AgentPosixSdkClient,
+    ) -> None:
+        run = self._load_run(run_id)
+        pending_ids = list(
+            dict.fromkeys(
+                str(item["request_id"])
+                for item in run.fs_cleanup
+                if item.get("kind") == "request_close"
+                and item.get("state") == "needs_recovery"
+                and isinstance(item.get("request_id"), str)
+            )
+        )
+        for request_id in pending_ids:
+            error: str | None = None
+            try:
+                client.invoke("fs.request.close", {"requestId": request_id})
+            except AgentPosixBridgeError as exc:
+                if exc.code != "RequestNotFound":
+                    error = str(exc)
+            if error is not None:
+                with self._run_transaction(run_id):
+                    latest = self._load_run(run_id)
+                    for item in latest.fs_cleanup:
+                        if (
+                            item.get("kind") == "request_close"
+                            and item.get("request_id") == request_id
+                            and item.get("state") == "needs_recovery"
+                        ):
+                            item["error"] = error
+                            item["updated_at"] = utc_timestamp()
+                            item["attempts"] = int(item.get("attempts", 0)) + 1
+                    self._write_run(latest)
+                continue
+            self._update_fs_request(
+                run_id,
+                request_id,
+                state="closed",
+                closed_at=utc_timestamp(),
+            )
+            with self._run_transaction(run_id):
+                latest = self._load_run(run_id)
+                for item in latest.fs_cleanup:
+                    if (
+                        item.get("kind") == "request_close"
+                        and item.get("request_id") == request_id
+                        and item.get("state") == "needs_recovery"
+                    ):
+                        item["state"] = "closed"
+                        item["recovered_at"] = utc_timestamp()
+                        item.pop("error", None)
+                self._write_run(latest)
+
+    def complete_pi_thinkthread_restore(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        branch_id: str,
+        target_snapshot_id: str,
+    ) -> None:
+        target = FsSnapshotArtifactRef(snapshot_id=target_snapshot_id)
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            record = self._load_candidate_record(run_id, candidate_id)
+            if record.task.fs_branch_id != branch_id:
+                raise RuntimeError("restored branch does not match candidate binding")
+            matching = [
+                item
+                for item in run.fs_cleanup
+                if item.get("kind") == "branch_restore"
+                and item.get("candidate_id") == candidate_id
+                and item.get("branch_id") == branch_id
+                and item.get("target_snapshot_id") == target_snapshot_id
+                and item.get("state")
+                in {"restore_required", "restoring", "restored"}
+            ]
+            if not matching:
+                raise RuntimeError("no durable restore intent matches branch reset")
+            matching[-1]["state"] = "restored"
+            matching[-1]["restored_at"] = utc_timestamp()
+            record.settled_artifact_ref = target
+            if record.iterations:
+                latest = record.iterations[-1]
+                if latest.disposition in {"discard", "failure"}:
+                    latest.settled_ref = target
+                    prior = next(
+                        (
+                            item
+                            for item in reversed(record.iterations[:-1])
+                            if item.attempt_ref == target
+                        ),
+                        None,
+                    )
+                    latest.restored_to_iteration = (
+                        prior.iteration if prior is not None else None
+                    )
+            self._write_candidate_record(run_id, record)
+            self._write_run(run)
+
     def _settle_process_verifier(
         self,
         *,
