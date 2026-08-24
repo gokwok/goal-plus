@@ -2493,6 +2493,213 @@ class FileSearchRuntime:
             self._kick_evidence_annotator(run_id)
         return report
 
+    def _reconcile_pi_thinkthread_iteration_replay(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        iteration: IterationRecord,
+        report: ScoreReport,
+    ) -> None:
+        """Repair run-derived state after candidate Evidence won a crash race.
+
+        ``candidate.json`` and ``run.json`` are separate atomic files. A worker
+        RPC replay can therefore observe the exact durable iteration before
+        the corresponding run best/restore intent was written. Rebuild only
+        the idempotent derived state bound to that iteration before returning
+        its saved report.
+        """
+
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            frozen = self._load_frozen_spec(run.frozen_spec_id)
+            record = self._load_candidate_record(run_id, candidate_id)
+            exact = next(
+                (
+                    item
+                    for item in record.iterations
+                    if item.rpc_request_id == iteration.rpc_request_id
+                    and item.iteration == iteration.iteration
+                    and item.attempt_ref == iteration.attempt_ref
+                ),
+                None,
+            )
+            if exact is None or exact is not record.iterations[-1]:
+                raise RuntimeError(
+                    "verifier idempotency replay lost its exact candidate Evidence"
+                )
+
+            replay_requests = [
+                item
+                for item in run.fs_requests
+                if item.request_id in exact.verifier_request_ids
+            ]
+            reason = str(run.budget_used.get("needs_recovery_reason") or "")
+            if (
+                run.state == RunState.NEEDS_RECOVERY
+                and replay_requests
+                and all(
+                    item.state in {"succeeded", "failed", "cancelled", "closed"}
+                    for item in replay_requests
+                )
+                and any(item.request_id in reason for item in replay_requests)
+            ):
+                previous = run.budget_used.pop(
+                    "fs_recovery_previous_state", RunState.RUNNING.value
+                )
+                run.budget_used.pop("needs_recovery_reason", None)
+                run.state = RunState(str(previous))
+
+            if exact.disposition in {"discard", "failure"}:
+                attempt = self._fs_snapshot_ref(
+                    exact.attempt_ref,
+                    field="replayed restore attempt",
+                )
+                target = self._fs_snapshot_ref(
+                    exact.settled_ref,
+                    field="replayed restore target",
+                )
+                branch_id = record.task.fs_branch_id
+                if not isinstance(branch_id, str):
+                    raise RuntimeError("replayed restore omitted candidate branch")
+                if not any(
+                    item.get("kind") == "branch_restore"
+                    and item.get("candidate_id") == candidate_id
+                    and item.get("branch_id") == branch_id
+                    and item.get("attempt_snapshot_id") == attempt.snapshot_id
+                    and item.get("target_snapshot_id") == target.snapshot_id
+                    for item in run.fs_cleanup
+                ):
+                    run.fs_cleanup.append(
+                        {
+                            "kind": "branch_restore",
+                            "state": "restore_required",
+                            "candidate_id": candidate_id,
+                            "branch_id": branch_id,
+                            "attempt_snapshot_id": attempt.snapshot_id,
+                            "target_snapshot_id": target.snapshot_id,
+                            "created_at": utc_timestamp(),
+                        }
+                    )
+
+            should_write_best = False
+            if (
+                exact.disposition in {"keep", "retain"}
+                and report.aggregate_score is not None
+            ):
+                if run.best_score is None:
+                    should_write_best = True
+                else:
+                    better = (
+                        report.aggregate_score > run.best_score
+                        if frozen.spec.metric_direction == "maximize"
+                        else report.aggregate_score < run.best_score
+                    )
+                    if better or run.best_candidate_id == candidate_id:
+                        should_write_best = True
+                    elif report.aggregate_score == run.best_score:
+                        best_path = self._run_dir(run_id) / "best.json"
+                        if not best_path.exists():
+                            should_write_best = True
+                        else:
+                            prior = BestArtifactRecord.model_validate(
+                                load_json(best_path)
+                            )
+                            should_write_best = prior.updated_at <= exact.created_at
+                if should_write_best:
+                    run.best_score = report.aggregate_score
+                    run.best_candidate_id = candidate_id
+                    self._write_best_fs_artifact(
+                        run,
+                        frozen.spec,
+                        record,
+                        exact,
+                    )
+
+            run.candidates_evaluated = len(
+                [
+                    item
+                    for item in self._load_candidate_records(run_id)
+                    if item.status == "evaluated"
+                ]
+            )
+            self._write_run(run)
+            try:
+                self._create_evidence_annotation_task(
+                    run_id,
+                    frozen,
+                    candidate_id,
+                    exact,
+                )
+            except Exception:
+                pass
+
+        if exact.agent_session_id is not None:
+            session = self._load_agent_session_by_id(
+                exact.agent_session_id,
+                run_id=run_id,
+            )
+            expected_runs = sum(
+                1
+                for item in record.iterations
+                if item.agent_session_id == exact.agent_session_id
+            )
+            counters = dict(session.counters)
+            counters["verifier_runs"] = max(
+                int(counters.get("verifier_runs", 0)),
+                expected_runs,
+            )
+            session.counters = counters
+            session.updated_at = utc_timestamp()
+            self._write_agent_session(session)
+
+    def finalize_pi_thinkthread_candidate(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        agent_session_id: str,
+        idempotency_key: str | None = None,
+    ) -> ScoreReport:
+        """Bind a turn-boundary verifier to the retained Child session.
+
+        The pool calls this only after ThinkThread reports that the Child
+        execution is absent.  It captures the private branch once more so edits
+        made after the worker's last verifier cannot escape exact-snapshot
+        settlement.
+        """
+
+        run = self._load_run(run_id)
+        frozen = self._load_frozen_spec(run.frozen_spec_id)
+        if frozen.spec.strategy.worker_host != "pi-thinkthread":
+            raise RuntimeError(
+                "turn-boundary exact verification requires worker_host=pi-thinkthread"
+            )
+        session = self._load_agent_session_by_id(agent_session_id, run_id=run_id)
+        if session.candidate_id != candidate_id or session.host != "pi-thinkthread":
+            raise PermissionError(
+                "turn-boundary verifier session does not match the ThinkThread candidate"
+            )
+        child_id = session.host_handle.external_id
+        if not child_id:
+            raise RuntimeError("turn-boundary verifier has no retained Child id")
+        child = self._agent_posix_client().invoke(
+            "thinkthread.get",
+            {"id": child_id},
+        )
+        if child.get("executionState") != "absent":
+            raise RuntimeError(
+                "turn-boundary verifier requires absent Child execution"
+            )
+        return self.run_verifier(
+            run_id,
+            candidate_id,
+            scope="process",
+            agent_session_id=agent_session_id,
+            hypothesis="parent turn-boundary exact snapshot verification",
+            idempotency_key=idempotency_key,
+        )
+
     def _run_verifier(
         self,
         run_id: str,
@@ -2501,6 +2708,7 @@ class FileSearchRuntime:
         agent_session_id: str | None = None,
         hypothesis: str | None = None,
         toolization_decision: ToolizationDecision | dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> ScoreReport:
         """Subagent self-score with ``agent_session_id``; main final verify
         without it. Process calls record ranking iterations; promotion calls
@@ -2509,7 +2717,16 @@ class FileSearchRuntime:
         with self._run_transaction(run_id):
             run = self._load_run(run_id)
             if scope == "process":
-                self._assert_worker_iteration_allowed(run, "run verifier")
+                recovery_replay = bool(
+                    idempotency_key is not None
+                    and run.state == RunState.NEEDS_RECOVERY
+                    and any(
+                        item.context.get("rpc_request_id") == idempotency_key
+                        for item in run.fs_requests
+                    )
+                )
+                if not recovery_replay:
+                    self._assert_worker_iteration_allowed(run, "run verifier")
             else:
                 self._assert_run_not_invalidated(run, "run verifier")
         frozen = self._load_frozen_spec(run.frozen_spec_id)
@@ -2548,14 +2765,19 @@ class FileSearchRuntime:
                     "promotion verification is parent-owned and cannot be "
                     "called from a candidate agent session"
                 )
+            selected_identity_present = (
+                isinstance(run.selected_artifact_ref, FsSnapshotArtifactRef)
+                if frozen.spec.strategy.worker_host == "pi-thinkthread"
+                else bool(run.selected_git_head)
+            )
             if (
                 run.state != RunState.READY_TO_PROMOTE
                 or run.selected_candidate_id != candidate_id
-                or not run.selected_git_head
+                or not selected_identity_present
             ):
                 raise RuntimeError(
                     "promotion verification requires the candidate and immutable "
-                    "Git revision selected by search_select"
+                    "artifact selected by search_select"
                 )
 
         session: AgentSessionRecord | None = None
@@ -2600,6 +2822,18 @@ class FileSearchRuntime:
                         f"use {verifier_seconds:.1f}s and closeout reserves "
                         f"{closeout_seconds:.1f}s"
                     )
+
+        if frozen.spec.strategy.worker_host == "pi-thinkthread":
+            return self._run_pi_thinkthread_verifier(
+                run=run,
+                frozen=frozen,
+                record=record,
+                scope=scope,
+                session=session,
+                hypothesis=hypothesis,
+                toolization_decision=normalized_toolization_decision,
+                idempotency_key=idempotency_key,
+            )
 
         results_were_initialized = record.results_ledger_git_head is not None
         self._ensure_results_tsv(record, frozen.spec.metric_name)
@@ -2687,8 +2921,15 @@ class FileSearchRuntime:
                 record = self._load_candidate_record(run_id, candidate_id)
                 self._apply_candidate_artifact_state(record, state)
                 record.promotion_report = report
+                selected_ref = (
+                    GitCommitArtifactRef(commit=run.selected_git_head)
+                    if run.selected_git_head is not None
+                    else None
+                )
                 record.promotion_evidence = PromotionEvidence(
                     candidate_id=candidate_id,
+                    selected_artifact_ref=selected_ref,
+                    artifact_ref=selected_ref,
                     selected_git_head=run.selected_git_head,
                     git_head=run.selected_git_head,
                     artifact_hash=state.artifact_hash,
