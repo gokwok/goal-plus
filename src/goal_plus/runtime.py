@@ -2952,6 +2952,63 @@ class FileSearchRuntime:
                         self._write_run(run)
             raise
 
+    @staticmethod
+    def _fs_snapshot_ref(
+        reference: object,
+        *,
+        field: str,
+    ) -> FsSnapshotArtifactRef:
+        if not isinstance(reference, FsSnapshotArtifactRef):
+            raise RuntimeError(
+                f"pi-thinkthread {field} must be an exact FsSnapshot artifact"
+            )
+        return reference
+
+    @staticmethod
+    def _fs_join_path(prefix: str, path: str) -> str:
+        normalized_prefix = PurePosixPath(prefix or ".")
+        normalized_path = PurePosixPath(path)
+        if normalized_path.is_absolute() or ".." in normalized_path.parts:
+            raise ValueError(f"invalid fs-relative path: {path!r}")
+        joined = (
+            normalized_path
+            if str(normalized_prefix) == "."
+            else normalized_prefix / normalized_path
+        )
+        return joined.as_posix()
+
+    @staticmethod
+    def _fs_source_projected_path(source_prefix: str, path: str) -> str:
+        prefix = PurePosixPath(source_prefix or ".")
+        candidate = PurePosixPath(path)
+        if str(prefix) == ".":
+            return candidate.as_posix()
+        try:
+            return candidate.relative_to(prefix).as_posix()
+        except ValueError:
+            return f"@workspace/{candidate.as_posix()}"
+
+    def _mark_fs_recovery(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            if run.state != RunState.NEEDS_RECOVERY:
+                run.budget_used.setdefault(
+                    "fs_recovery_previous_state",
+                    (
+                        run.state.value
+                        if isinstance(run.state, RunState)
+                        else str(run.state)
+                    ),
+                )
+            run.state = RunState.NEEDS_RECOVERY
+            run.budget_used["needs_recovery_reason"] = reason
+            self._write_run(run)
+
     def _settle_process_verifier(
         self,
         *,
