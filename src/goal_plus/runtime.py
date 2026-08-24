@@ -4794,6 +4794,146 @@ class FileSearchRuntime:
                 artifact_hash=reader.canonical_digest(baseline, selected),
                 continuation_required=False,
             )
+
+        record.detected_changed_files = list(attempt.changed_files)
+        record.touched_denied_files = attempt.touched_denied_files
+        record.changed_outside_allowed = attempt.changed_outside_allowed
+        results: list[VerifierResult] = []
+        request_ids: list[str] = (
+            [attempt.snapshot_request_id]
+            if attempt.snapshot_request_id is not None
+            else []
+        )
+        if attempt.touched_denied_files or attempt.changed_outside_allowed:
+            results.append(
+                VerifierResult(
+                    name="edit_surface_check",
+                    role=VerifierRole.ANTI_CHEAT_GATE,
+                    passed=False,
+                    score=0.0,
+                    metrics={
+                        "detected_changed_files": attempt.changed_files,
+                        "touched_denied_files": attempt.touched_denied_files,
+                        "changed_outside_allowed": attempt.changed_outside_allowed,
+                    },
+                    failure_class="EditSurfaceViolation",
+                )
+            )
+        else:
+            frozen_hash_failures = self._fs_frozen_hash_failures(
+                reader=reader,
+                artifact=attempt.attempt_ref,
+                source_prefix=run.fs_source_relative_path or ".",
+                frozen=frozen,
+            )
+            if frozen_hash_failures:
+                results.append(
+                    VerifierResult(
+                        name="frozen_hash_check",
+                        role=VerifierRole.ANTI_CHEAT_GATE,
+                        passed=False,
+                        score=0.0,
+                        metrics={"hash_failures": frozen_hash_failures},
+                        failure_class="FrozenVerifierModified",
+                    )
+                )
+        if not results:
+            commands = (
+                frozen.spec.process_verifiers
+                if scope == "process"
+                else frozen.spec.promotion_verifiers or frozen.spec.process_verifiers
+            )
+            phase: Literal["candidate", "promotion"] = (
+                "candidate" if scope == "process" else "promotion"
+            )
+            for command in commands:
+                result, request_id = self._fs_run_verifier_command(
+                    client=client,
+                    reader=reader,
+                    run=run,
+                    frozen=frozen,
+                    record=record,
+                    artifact=attempt.attempt_ref,
+                    command=command,
+                    verifier_phase=phase,
+                    idempotency_key=idempotency_key,
+                )
+                results.append(result)
+                if request_id is not None:
+                    request_ids.append(request_id)
+                if result.failure_class == "VerifierInfrastructureFailure":
+                    break
+        report = self._fs_score_report(
+            run=run,
+            record=record,
+            frozen=frozen,
+            results=results,
+            scope=scope,
+            touched_denied_files=attempt.touched_denied_files,
+            changed_outside_allowed=attempt.changed_outside_allowed,
+        )
+        if scope == "promotion":
+            report = report.model_copy(
+                update={
+                    "best_artifact_ref": attempt.attempt_ref,
+                    "workspace_artifact_after_settlement": attempt.attempt_ref,
+                }
+            )
+            with self._run_transaction(run.run_id):
+                current_run = self._load_run(run.run_id)
+                current_record = self._load_candidate_record(
+                    run.run_id,
+                    record.candidate_id,
+                )
+                current_record.promotion_report = report
+                current_record.promotion_evidence = PromotionEvidence(
+                    candidate_id=record.candidate_id,
+                    selected_artifact_ref=attempt.attempt_ref,
+                    artifact_ref=attempt.attempt_ref,
+                    artifact_hash=attempt.artifact_hash,
+                    passed=bool(report.promotion_passed),
+                    created_at=utc_timestamp(),
+                )
+                self._write_candidate_record(run.run_id, current_record)
+                self._write_run(current_run)
+            self._close_fs_requests_after_evidence(run.run_id, request_ids, client)
+            return report
+
+        shared_settlement: SharedDirSettlement | None = None
+        shared_settlement_error: str | None = None
+        if (
+            frozen.spec.shared_dir.enabled
+            and report.process_passed
+            and session is not None
+            and record.pending_fs_tool_stages
+        ):
+            try:
+                shared_settlement = self._settle_pi_thinkthread_shared_tools(
+                    client=client,
+                    run=run,
+                    frozen=frozen,
+                    record=record,
+                    attempt_ref=attempt.attempt_ref,
+                    iteration=len(record.iterations) + 1,
+                    settlement_id=idempotency_key,
+                )
+            except Exception as exc:
+                shared_settlement_error = (
+                    f"shared tool snapshot failed: {type(exc).__name__}: {exc}"
+                )
+        staged_entries = [
+            str(item.get("staged_name"))
+            for item in record.pending_fs_tool_stages
+            if item.get("staged_name")
+        ]
+        toolization_advisories = []
+        if frozen.spec.shared_dir.enabled and session is not None:
+            if toolization_decision is None:
+                toolization_advisories.append("toolization_review_missing")
+            elif toolization_decision.outcome == "staged" and not staged_entries:
+                toolization_advisories.append("toolization_stage_missing")
+            elif toolization_decision.outcome == "not_applicable" and staged_entries:
+                toolization_advisories.append("toolization_decision_mismatch")
         raise NotImplementedError
 
     def _settle_process_verifier(
