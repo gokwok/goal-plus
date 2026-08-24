@@ -10697,8 +10697,10 @@ class FileSearchRuntime:
             ),
             None,
         )
-        if iteration is None or iteration.git_head is None:
-            raise RuntimeError("annotation requires commit-backed worker evidence")
+        if iteration is None or (
+            iteration.attempt_ref is None and iteration.git_head is None
+        ):
+            raise RuntimeError("annotation requires artifact-backed worker evidence")
         task = self._load_evidence_annotation_task(
             run_id, candidate_id, iteration_number
         )
@@ -10708,61 +10710,92 @@ class FileSearchRuntime:
         if (
             task.attempt_commit != commit
             or task.attempt_base_commit != iteration.attempt_base_git_head
+            or task.attempt_ref != iteration.attempt_ref
+            or task.attempt_base_ref != iteration.attempt_base_ref
             or task.attempt_changed_files != iteration.attempt_changed_files
         ):
             raise RuntimeError("annotation task does not match settled Evidence")
-        if self._git_returncode(
-            record.task.workspace,
-            ["git", "cat-file", "-e", f"{task.attempt_base_commit}^{{commit}}"],
-        ) != 0 or self._git_returncode(
-            record.task.workspace,
-            ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
-        ) != 0:
-            raise RuntimeError("annotation Evidence commit is unavailable")
-        diff = ""
-        if task.attempt_changed_files:
-            diff = self._git_output_bounded(
-                record.task.workspace,
-                [
-                    "git",
-                    "diff",
-                    "--full-index",
-                    "--no-ext-diff",
-                    "--function-context",
-                    "--unified=10",
-                    task.attempt_base_commit,
-                    commit,
-                    "--",
-                    *task.attempt_changed_files,
-                ],
-                max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+        candidate_base_commit: str | None = None
+        candidate_base_ref = None
+        exact_attempt_ref = task.attempt_ref
+        if isinstance(iteration.attempt_ref, FsSnapshotArtifactRef):
+            self._fs_snapshot_ref(
+                task.attempt_base_ref,
+                field="annotation attempt base",
             )
-        candidate_base_commit = (
-            record.task.workspace_base_revision or task.attempt_base_commit
-        )
-        candidate_changed_files = self._git_changed_files(
-            record.task.workspace,
-            candidate_base_commit,
-            commit,
-        )
-        candidate_diff = ""
-        if candidate_changed_files:
-            candidate_diff = self._git_output_bounded(
-                record.task.workspace,
-                [
-                    "git",
-                    "diff",
-                    "--full-index",
-                    "--no-ext-diff",
-                    "--function-context",
-                    "--unified=10",
-                    candidate_base_commit,
-                    commit,
-                    "--",
-                    *candidate_changed_files,
-                ],
-                max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+            self._fs_snapshot_ref(
+                task.attempt_ref,
+                field="annotation attempt",
             )
+            diff = iteration.actual_diff or ""
+            candidate_base_ref = self._fs_snapshot_ref(
+                run.baseline_artifact_ref,
+                field="annotation candidate baseline",
+            )
+            candidate_changed_files = list(iteration.changed_files)
+            candidate_diff = iteration.cumulative_diff or ""
+        else:
+            if commit is None:
+                raise RuntimeError("annotation Evidence commit is unavailable")
+            if task.attempt_base_commit is None:
+                raise RuntimeError("annotation Evidence base commit is unavailable")
+            if record.task.workspace is None:
+                raise RuntimeError("Git annotation requires a candidate workspace")
+            reader = GitArtifactReader(record.task.workspace)
+            attempt_base_ref = (
+                task.attempt_base_ref
+                or GitCommitArtifactRef(commit=task.attempt_base_commit)
+            )
+            exact_attempt_ref = (
+                task.attempt_ref or GitCommitArtifactRef(commit=commit)
+            )
+            if not isinstance(attempt_base_ref, GitCommitArtifactRef) or not isinstance(
+                exact_attempt_ref,
+                GitCommitArtifactRef,
+            ):
+                raise RuntimeError("Git annotation requires git_commit ArtifactRefs")
+            try:
+                diff = reader.diff(
+                    attempt_base_ref,
+                    exact_attempt_ref,
+                    paths=task.attempt_changed_files,
+                    max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+                )
+                if diff.endswith("\n[diff truncated]\n"):
+                    raise RuntimeError(
+                        "annotation diff exceeds "
+                        f"{MAX_EVIDENCE_ANNOTATION_DIFF_BYTES} bytes"
+                    )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise RuntimeError(
+                    "annotation Evidence commit is unavailable"
+                ) from exc
+            candidate_base_commit = (
+                record.task.workspace_base_revision or task.attempt_base_commit
+            )
+            candidate_base_ref = GitCommitArtifactRef(
+                commit=candidate_base_commit
+            )
+            try:
+                candidate_changed_files = reader.changed_files(
+                    candidate_base_ref,
+                    exact_attempt_ref,
+                )
+                candidate_diff = reader.diff(
+                    candidate_base_ref,
+                    exact_attempt_ref,
+                    paths=candidate_changed_files,
+                    max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+                )
+                if candidate_diff.endswith("\n[diff truncated]\n"):
+                    raise RuntimeError(
+                        "annotation cumulative diff exceeds "
+                        f"{MAX_EVIDENCE_ANNOTATION_DIFF_BYTES} bytes"
+                    )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise RuntimeError(
+                    "annotation candidate baseline is unavailable"
+                ) from exc
         peer_evidence = self._evidence_comparison_peers(
             run_id,
             comparison_basis=task.comparison_basis,
@@ -10826,15 +10859,25 @@ class FileSearchRuntime:
             "candidate_id": candidate_id,
             "iteration": iteration.iteration,
             "agent_summary": iteration.hypothesis,
+            "exact_attempt_artifact_ref": (
+                exact_attempt_ref.model_dump(mode="json")
+                if exact_attempt_ref is not None
+                else None
+            ),
             "exact_attempt_commit": commit,
             "changed_files": list(task.attempt_changed_files),
             "actual_diff": diff,
             "candidate_base_commit": candidate_base_commit,
+            "candidate_base_artifact_ref": (
+                candidate_base_ref.model_dump(mode="json")
+                if candidate_base_ref is not None
+                else None
+            ),
             "candidate_changed_files": candidate_changed_files,
             "candidate_diff": candidate_diff,
             "diff_context_policy": (
-                "git function context with at least 10 unchanged lines around hunks; "
-                "output remains byte-bounded and may omit definitions outside the diff"
+                "ArtifactReader exact diff with function context and byte-bounded "
+                "output; definitions outside the retained projection may be omitted"
             ),
             "verifier_result": {
                 "score": iteration.score,
@@ -10944,6 +10987,7 @@ class FileSearchRuntime:
         frozen = self._load_frozen_spec(run.frozen_spec_id)
         reverse = frozen.spec.metric_direction == "maximize"
         settled = []
+        is_thinkthread = frozen.spec.strategy.worker_host == "pi-thinkthread"
         for record in self._load_candidate_records(run_id):
             if record.candidate_id == target_candidate_id:
                 continue
@@ -10951,7 +10995,11 @@ class FileSearchRuntime:
                 iteration
                 for iteration in record.iterations
                 if iteration.agent_session_id is not None
-                and self._git_iteration_eligible(iteration)
+                and (
+                    self._fs_iteration_eligible(iteration)
+                    if is_thinkthread
+                    else self._git_iteration_eligible(iteration)
+                )
                 and iteration.disposition in {None, "keep"}
             ]
             if not eligible:
@@ -10973,6 +11021,11 @@ class FileSearchRuntime:
             {
                 "candidate_id": record.candidate_id,
                 "iteration": iteration.iteration,
+                "artifact_ref": (
+                    iteration.attempt_ref.model_dump(mode="json")
+                    if iteration.attempt_ref is not None
+                    else None
+                ),
                 "commit": iteration.git_head,
             }
             for _, record, iteration in settled[-MAX_EVIDENCE_COMPARISON_PEERS:]
@@ -10998,49 +11051,75 @@ class FileSearchRuntime:
                     item
                     for item in record.iterations
                     if item.iteration == reference.iteration
-                    and item.git_head == reference.commit
+                    and (
+                        item.attempt_ref == reference.artifact_ref
+                        if reference.artifact_ref is not None
+                        else item.git_head == reference.commit
+                    )
                 ),
                 None,
             )
-            if iteration is None or iteration.git_head is None:
+            if iteration is None or (
+                iteration.attempt_ref is None and iteration.git_head is None
+            ):
                 raise RuntimeError("annotation comparison Evidence is unavailable")
-            assert iteration.git_head is not None
-            base_commit = (
-                record.task.workspace_base_revision
-                or iteration.attempt_base_git_head
-            )
             changed_files: list[str] = []
             peer_diff: str | None = None
             diff_omitted: str | None = None
-            if base_commit:
-                try:
-                    changed_files = self._git_changed_files(
-                        record.task.workspace,
-                        base_commit,
-                        iteration.git_head,
-                    )
-                    if changed_files:
-                        peer_diff = self._git_output_bounded(
-                            record.task.workspace,
-                            [
-                                "git",
-                                "diff",
-                                "--full-index",
-                                "--no-ext-diff",
-                                base_commit,
-                                iteration.git_head,
-                                "--",
-                                *changed_files,
-                            ],
-                            max_bytes=MAX_EVIDENCE_PEER_DIFF_BYTES,
+            if isinstance(iteration.attempt_ref, FsSnapshotArtifactRef):
+                self._fs_snapshot_ref(
+                    iteration.attempt_base_ref,
+                    field="comparison base",
+                )
+                changed_files = list(iteration.attempt_changed_files)
+                peer_diff = _bounded_projection(
+                    iteration.actual_diff,
+                    MAX_EVIDENCE_PEER_DIFF_BYTES,
+                )
+                if changed_files and peer_diff is None:
+                    diff_omitted = "persisted diff projection unavailable"
+            else:
+                assert iteration.git_head is not None
+                base_commit = (
+                    record.task.workspace_base_revision
+                    or iteration.attempt_base_git_head
+                )
+                if base_commit:
+                    try:
+                        if record.task.workspace is None:
+                            raise RuntimeError(
+                                "Git peer comparison requires a candidate workspace"
+                            )
+                        reader = GitArtifactReader(record.task.workspace)
+                        base_ref = GitCommitArtifactRef(commit=base_commit)
+                        target_ref = (
+                            iteration.attempt_ref
+                            or GitCommitArtifactRef(commit=iteration.git_head)
                         )
-                except (RuntimeError, subprocess.CalledProcessError) as exc:
-                    diff_omitted = f"{type(exc).__name__}: {exc}"[:500]
-                    peer_diff = None
+                        if not isinstance(target_ref, GitCommitArtifactRef):
+                            raise RuntimeError(
+                                "Git peer comparison requires git_commit ArtifactRefs"
+                            )
+                        changed_files = reader.changed_files(base_ref, target_ref)
+                        if changed_files:
+                            peer_diff = reader.diff(
+                                base_ref,
+                                target_ref,
+                                paths=changed_files,
+                                max_bytes=MAX_EVIDENCE_PEER_DIFF_BYTES,
+                            )
+                    except (RuntimeError, subprocess.CalledProcessError) as exc:
+                        diff_omitted = f"{type(exc).__name__}: {exc}"[:500]
+                        peer_diff = None
             peers.append(
                 {
                     "candidate_id": record.candidate_id,
                     "iteration": iteration.iteration,
+                    "artifact_ref": (
+                        iteration.attempt_ref.model_dump(mode="json")
+                        if iteration.attempt_ref is not None
+                        else None
+                    ),
                     "commit": iteration.git_head,
                     "score": iteration.score,
                     "process_passed": iteration.process_passed,
@@ -11115,7 +11194,17 @@ class FileSearchRuntime:
     def _load_frozen_spec(self, frozen_spec_id: str) -> FrozenSpec:
         data = load_json(self._spec_dir(frozen_spec_id) / "frozen_spec.json")
         spec_data = data.get("spec")
-        if isinstance(spec_data, dict) and "workspace" not in spec_data:
+        strategy_data = spec_data.get("strategy") if isinstance(spec_data, dict) else None
+        worker_host = (
+            strategy_data.get("worker_host")
+            if isinstance(strategy_data, dict)
+            else None
+        )
+        if (
+            isinstance(spec_data, dict)
+            and "workspace" not in spec_data
+            and worker_host != "pi-thinkthread"
+        ):
             # Frozen specs created before workspace backends were persisted used
             # an independent copy for every candidate. Preserve that behavior
             # when resuming legacy runs even though new specs default to a
@@ -11151,7 +11240,11 @@ class FileSearchRuntime:
         record = CandidateRecord.model_validate(
             load_json(self._candidate_dir(run_id, candidate_id) / "candidate.json")
         )
-        if not record.results_ledger and record.results_ledger_git_head is None:
+        if (
+            record.task.workspace is not None
+            and not record.results_ledger
+            and record.results_ledger_git_head is None
+        ):
             record.results_ledger = self._read_results_tsv(record)
         return record
 
