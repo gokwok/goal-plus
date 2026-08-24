@@ -4934,6 +4934,179 @@ class FileSearchRuntime:
                 toolization_advisories.append("toolization_stage_missing")
             elif toolization_decision.outcome == "not_applicable" and staged_entries:
                 toolization_advisories.append("toolization_decision_mismatch")
+
+        prior_best = self._best_iteration_record(
+            record,
+            frozen.spec.metric_direction,
+        )
+        iteration_number = len(record.iterations) + 1
+        iteration_hypothesis = self._iteration_hypothesis(
+            hypothesis,
+            record,
+            iteration_number,
+            scope="process",
+            agent_session_id=session.agent_session_id if session else None,
+        )
+        created_at = utc_timestamp()
+        failure_class = next(
+            (
+                result.failure_class
+                for result in report.verifier_results
+                if result.failure_class
+            ),
+            None,
+        )
+        iteration = IterationRecord(
+            iteration=iteration_number,
+            rpc_request_id=idempotency_key,
+            agent_session_id=session.agent_session_id if session else None,
+            selected_model=(
+                session.selected_model.model
+                if session and session.selected_model
+                else None
+            ),
+            exact_model_ref=(
+                session.model_provenance.get("exact_model_ref") if session else None
+            ),
+            adapter_version=(
+                session.model_provenance.get("adapter_version") if session else None
+            ),
+            model_provenance=session.model_provenance if session else {},
+            score=report.aggregate_score,
+            process_passed=report.process_passed,
+            attempt_base_ref=attempt.base_ref,
+            attempt_ref=attempt.attempt_ref,
+            verifier_request_ids=request_ids,
+            actual_diff=attempt.actual_diff,
+            cumulative_diff=attempt.cumulative_diff,
+            attempt_changed_files=attempt.changed_files,
+            failure_class=failure_class,
+            summary=iteration_hypothesis,
+            hypothesis=iteration_hypothesis,
+            changed_files=attempt.changed_files,
+            touched_denied_files=attempt.touched_denied_files,
+            changed_outside_allowed=attempt.changed_outside_allowed,
+            artifact_hash=attempt.artifact_hash,
+            metrics={
+                **{
+                    result.name: result.metrics
+                    for result in report.verifier_results
+                },
+                "thinkthread_continuation_required": attempt.continuation_required,
+            },
+            log_paths=[
+                str(result.log_path)
+                for result in report.verifier_results
+                if result.log_path is not None
+            ],
+            shared_tools=(shared_settlement.tools if shared_settlement else []),
+            shared_tool_errors=(
+                shared_settlement.errors
+                if shared_settlement
+                else [shared_settlement_error]
+                if shared_settlement_error
+                else []
+            ),
+            shared_tool_staged_entries=staged_entries,
+            shared_tool_staged_file_count=(
+                shared_settlement.staged_file_count if shared_settlement else 0
+            ),
+            shared_tool_staged_bytes=(
+                shared_settlement.staged_bytes if shared_settlement else 0
+            ),
+            shared_tool_consumed_entries=(
+                shared_settlement.consumed_entries if shared_settlement else []
+            ),
+            shared_tool_deduplicated_entries=(
+                shared_settlement.deduplicated_entries
+                if shared_settlement
+                else []
+            ),
+            shared_tool_publish_status=(
+                "partially_published"
+                if shared_settlement
+                and shared_settlement.tools
+                and shared_settlement.errors
+                else "published"
+                if shared_settlement and shared_settlement.tools
+                else "consumed_unchanged"
+                if shared_settlement and shared_settlement.consumed_entries
+                else "snapshot_rejected"
+                if shared_settlement and shared_settlement.errors
+                else "snapshot_error"
+                if shared_settlement_error
+                else "skipped_failed_verifier"
+                if staged_entries and not report.process_passed
+                else "not_staged"
+            ),
+            adopted_tools=[
+                ToolAdoptionRecord(
+                    tool_id=receipt.tool_id,
+                    snapshot_hash=receipt.snapshot_hash,
+                    receipt_id=receipt.receipt_id,
+                )
+                for receipt in record.pending_tool_copies
+                if receipt.target_snapshot_id is not None
+            ],
+            adoption_confounded=(
+                None
+                if not record.pending_tool_copies
+                else len(record.pending_tool_copies) != 1
+                or len(attempt.changed_files) > 2
+            ),
+            toolization_decision=toolization_decision,
+            toolization_advisories=toolization_advisories,
+            created_at=created_at,
+        )
+        disposition = self._fs_iteration_disposition(
+            iteration,
+            prior_best,
+            frozen.spec.metric_direction,
+        )
+        iteration.disposition = disposition
+        best_iteration = iteration if disposition in {"keep", "retain"} else prior_best
+        settled_ref = (
+            attempt.attempt_ref
+            if disposition in {"keep", "retain"}
+            else self._fs_snapshot_ref(
+                (
+                    prior_best.attempt_ref
+                    if prior_best is not None
+                    else attempt.base_ref
+                ),
+                field="restore target",
+            )
+        )
+        iteration.settled_ref = settled_ref
+        report = report.model_copy(
+            update={
+                "disposition": disposition,
+                "best_iteration": (
+                    best_iteration.iteration if best_iteration is not None else None
+                ),
+                "best_artifact_ref": (
+                    best_iteration.attempt_ref
+                    if best_iteration is not None
+                    else None
+                ),
+                "workspace_artifact_after_settlement": settled_ref,
+                "shared_tool_staged_entries": iteration.shared_tool_staged_entries,
+                "shared_tool_staged_file_count": (
+                    iteration.shared_tool_staged_file_count
+                ),
+                "shared_tool_staged_bytes": iteration.shared_tool_staged_bytes,
+                "shared_tool_publish_status": iteration.shared_tool_publish_status,
+                "shared_tool_errors": iteration.shared_tool_errors,
+                "shared_tool_consumed_entries": (
+                    iteration.shared_tool_consumed_entries
+                ),
+                "shared_tool_deduplicated_entries": (
+                    iteration.shared_tool_deduplicated_entries
+                ),
+                "toolization_decision": iteration.toolization_decision,
+                "toolization_advisories": iteration.toolization_advisories,
+            }
+        )
         raise NotImplementedError
 
     def _settle_process_verifier(
