@@ -894,3 +894,119 @@ def _dispatch(
     if tool == "search_list_iterations":
         return tools.search_list_iterations(run_id, candidate_id)
     raise AssertionError(tool)
+
+
+def _require_turn_boundary_wake(job: dict[str, Any], reason: str) -> None:
+    intent = job.get("turn_boundary_wake_required")
+    if not isinstance(intent, dict):
+        intent = {
+            "state": "required",
+            "reasons": [],
+            "required_at": utc_timestamp(),
+        }
+        job["turn_boundary_wake_required"] = intent
+    reasons = intent.setdefault("reasons", [])
+    if reason not in reasons:
+        reasons.append(reason)
+    if intent.get("state") not in {"waking", "outcome_unknown"}:
+        intent["state"] = "required"
+
+
+def _complete_turn_boundary_wake(job: dict[str, Any]) -> None:
+    intent = job.get("turn_boundary_wake_required")
+    if not isinstance(intent, dict):
+        return
+    intent["state"] = "woken"
+    intent["woken_at"] = utc_timestamp()
+    checkpoint = job.get("checkpoint_continuation")
+    if (
+        "checkpoint_resume" in intent.get("reasons", [])
+        and isinstance(checkpoint, dict)
+    ):
+        checkpoint["state"] = "resumed"
+        checkpoint["resumed_at"] = intent["woken_at"]
+    job.setdefault("turn_boundary_wakes", []).append(dict(intent))
+    job.pop("turn_boundary_wake_required", None)
+
+
+def _response_chunks(request_id: str, response: dict[str, Any]) -> list[str]:
+    data = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode()
+    response_hash = hashlib.sha256(data).hexdigest()
+    pieces = [data[index : index + RESPONSE_CHUNK_BYTES] for index in range(0, len(data), RESPONSE_CHUNK_BYTES)] or [b""]
+    messages = []
+    for index, piece in enumerate(pieces):
+        messages.append(
+            json.dumps(
+                {
+                    "protocol": PROTOCOL,
+                    "type": "response_chunk",
+                    "request_id": request_id,
+                    "chunk_index": index,
+                    "chunk_count": len(pieces),
+                    "data_base64": base64.b64encode(piece).decode("ascii"),
+                    "chunk_sha256": hashlib.sha256(piece).hexdigest(),
+                    "response_sha256": response_hash,
+                },
+                separators=(",", ":"),
+            )
+        )
+    return messages
+
+
+def _response_hash(response: dict[str, Any]) -> str:
+    data = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _send_pending_response(
+    sdk: AgentPosixSdkClient,
+    job: dict[str, Any],
+    request_id: str,
+) -> None:
+    pending = job.setdefault("pending_responses", {})
+    record = pending.get(request_id)
+    settled = job.setdefault("settled_requests", {}).get(request_id)
+    if not isinstance(record, dict) or not isinstance(settled, dict):
+        return
+    response = settled.get("response")
+    if not isinstance(response, dict):
+        return
+    for chunk in _response_chunks(request_id, response):
+        sdk.invoke(
+            "message.send",
+            {
+                "recipientThinkthreadId": job["thinkthread_id"],
+                "text": chunk,
+                "wake": False,
+                "replyToMessageId": record.get("reply_to_message_id"),
+            },
+        )
+    record["attempts"] = int(record.get("attempts", 0)) + 1
+    record["last_attempt_unix"] = time.time()
+    record["last_attempt_at"] = utc_timestamp()
+
+
+def _retry_pending_responses(
+    sdk: AgentPosixSdkClient,
+    job: dict[str, Any],
+) -> None:
+    pending = job.get("pending_responses")
+    if not isinstance(pending, dict):
+        return
+    now = time.time()
+    for request_id, record in list(pending.items()):
+        if not isinstance(record, dict):
+            continue
+        last_attempt = _timestamp_epoch(record.get("last_attempt_unix")) or 0.0
+        if now - last_attempt < 0.5:
+            continue
+        try:
+            _send_pending_response(sdk, job, str(request_id))
+        except AgentPosixBridgeError as exc:
+            record["last_error"] = {
+                "message": str(exc),
+                "error_code": exc.code,
+                "completion_unknown": exc.completion_unknown,
+            }
+            record["last_attempt_unix"] = now
+            record["last_attempt_at"] = utc_timestamp()
