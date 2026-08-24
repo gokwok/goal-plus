@@ -1938,3 +1938,259 @@ def test_publication_recovery_reconciles_selected_root_before_verifier(
 
 
 @pytest.mark.pi
+def test_publication_conflict_never_overwrites_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="detect a strict publication conflict",
+    )
+    runtime.select(run_id)
+    client.root_snapshot_id = "fsnap-unrelated-root"
+    client.replace_error_code = "FsBaseMismatch"
+
+    with pytest.raises(RuntimeError, match="WorkspacePublicationConflict"):
+        runtime.promote(run_id, task.candidate_id)
+
+    assert client.root_snapshot_id == "fsnap-unrelated-root"
+    run = runtime._load_run(run_id)
+    assert run.state == "ready_to_promote"
+    assert run.publication is not None
+    assert run.publication.state == "outcome_unknown"
+    assert run.publication.manifest == {
+        "status": "conflict",
+        "request_id": run.publication.request_id,
+        "baseline_matches": False,
+        "selected_matches": False,
+        "recorded_at": run.publication.manifest["recorded_at"],
+    }
+
+    failed_request_id = run.publication.request_id
+    client.root_snapshot_id = "fsnap-baseline"
+    client.replace_error_code = None
+
+    manifest_path = runtime.promote(run_id, task.candidate_id)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "committed"
+    assert manifest["request_id"] != failed_request_id
+    run = runtime._load_run(run_id)
+    attempts = {
+        item.request_id: item
+        for item in run.fs_requests
+        if item.operation == "replace"
+    }
+    assert attempts[failed_request_id].state == "closed"
+    assert attempts[manifest["request_id"]].state == "closed"
+    assert client.root_snapshot_id == "fsnap-attempt"
+
+
+@pytest.mark.pi
+def test_terminal_report_reclaims_owned_snapshots_after_pool_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [1.5]
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    pool = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="publish and reclaim exact snapshots",
+    )
+    runtime.select(run_id)
+    runtime.promote(run_id, task.candidate_id)
+
+    deferred_report = runtime.report(run_id)
+    deferred_run = runtime._load_run(run_id)
+    assert any(
+        item.get("kind") == "snapshot_cleanup"
+        and item.get("state") == "deferred_pool_open"
+        for item in deferred_run.fs_cleanup
+    )
+    assert client.snapshots == {"fsnap-baseline", "fsnap-attempt-1"}
+
+    close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool["pool_id"],
+        mode="interrupt",
+        client=client,
+    )
+    client.snapshot_remove_completion_unknown_once = True
+    report_path = runtime.report(run_id)
+
+    assert report_path == deferred_report
+    assert client.snapshots == set()
+    remove_calls = [
+        params
+        for operation, params in client.operations
+        if operation == "fs.snapshot.remove"
+    ]
+    assert [item["snapshotId"] for item in remove_calls] == [
+        "fsnap-attempt-1",
+        "fsnap-baseline",
+    ]
+    run = runtime._load_run(run_id)
+    cleanup = next(
+        item
+        for item in reversed(run.fs_cleanup)
+        if item.get("kind") == "snapshot_cleanup"
+    )
+    assert cleanup["state"] == "complete"
+    assert cleanup["pending"] == []
+    assert cleanup["storage"]["snapshotCount"] == 0
+    remove_requests = [
+        item for item in run.fs_requests if item.operation == "snapshot_remove"
+    ]
+    assert len(remove_requests) == 2
+    assert all(item.state == "closed" for item in remove_requests)
+    assert any(
+        operation == "fs.request.status"
+        for operation, _params in client.operations
+    )
+    assert all(
+        intent.state == "cleaned"
+        for intent in run.fs_snapshot_intents
+        if intent.snapshot_id is not None
+    )
+    candidate = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert all(
+        intent.state == "cleaned"
+        for intent in candidate.fs_snapshot_intents
+        if intent.snapshot_id is not None
+    )
+    assert '"snapshotCount":0' in report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.pi
+def test_external_evidence_binds_exact_fs_snapshot_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "external"
+    directory.mkdir()
+    monkeypatch.setenv("GOAL_PLUS_EXTERNAL_EVIDENCE_DIR", str(directory))
+    payload = {
+        "source": "official-judge",
+        "artifact": {
+            "source": "goal_plus_best",
+            "run_id": "run_1",
+            "candidate_id": "c001",
+            "iteration": 1,
+            "artifact_ref": {
+                "kind": "fs_snapshot",
+                "snapshot_id": "fsnap-attempt-1",
+            },
+        },
+        "evaluation": {"status": "completed", "score": 97},
+    }
+    (directory / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+    evidence = [
+        {
+            "candidate_id": "c001",
+            "iteration": 1,
+            "artifact_ref": {
+                "kind": "fs_snapshot",
+                "snapshot_id": "fsnap-attempt-1",
+            },
+        }
+    ]
+
+    FileSearchRuntime.attach_external_evaluations("run_1", evidence)
+
+    assert evidence[0]["external_evaluations"] == [
+        {"status": "completed", "score": 97, "source": "official-judge"}
+    ]
+
+
+@pytest.mark.pi
+def test_shared_tool_is_published_from_the_exact_attempt_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    staged = runtime.stage_shared_tool(
+        session.agent_session_id,
+        name="probe",
+        summary="Reusable deterministic probe",
+        entrypoint="probe.py:probe",
+        candidate_relative_source_paths=[".tmp/tool-drafts/probe.py"],
+    )
+
+    report = runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="publish exact shared tool",
+        toolization_decision={
+            "outcome": "staged",
+            "signals": ["domain_probe"],
+            "rationale": "Peers can reuse the deterministic probe.",
+            "tool_names": ["probe"],
+        },
+    )
+
+    assert staged["staging_path"].startswith("snapshot://next/")
+    assert report.shared_tool_publish_status == "published"
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert record.pending_fs_tool_stages == []
+    assert len(record.iterations[0].shared_tools) == 1
+    tool = record.iterations[0].shared_tools[0]
+    assert tool.source_artifact_ref == FsSnapshotArtifactRef(
+        snapshot_id="fsnap-attempt"
+    )
+    assert (tool.read_only_path / "probe.py").read_text(encoding="utf-8").startswith(
+        "def probe"
+    )
+
+
+@pytest.mark.pi
