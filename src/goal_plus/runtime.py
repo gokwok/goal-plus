@@ -3009,6 +3009,150 @@ class FileSearchRuntime:
             run.budget_used["needs_recovery_reason"] = reason
             self._write_run(run)
 
+    def _append_fs_request(
+        self,
+        run_id: str,
+        request: FsRequestRecord,
+    ) -> None:
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            if any(item.request_id == request.request_id for item in run.fs_requests):
+                raise RuntimeError(f"duplicate fs request id: {request.request_id}")
+            run.fs_requests.append(request)
+            self._write_run(run)
+
+    def _update_fs_request(
+        self,
+        run_id: str,
+        request_id: str,
+        *,
+        state: str,
+        result: dict[str, Any] | None | object = _UNSET,
+        error: dict[str, Any] | None | object = _UNSET,
+        closed_at: str | None = None,
+    ) -> None:
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            request = next(
+                (item for item in run.fs_requests if item.request_id == request_id),
+                None,
+            )
+            if request is None:
+                raise RuntimeError(f"fs request is not persisted: {request_id}")
+            request.state = state  # type: ignore[assignment]
+            if result is not _UNSET:
+                request.result = result  # type: ignore[assignment]
+            if error is not _UNSET:
+                request.error = error  # type: ignore[assignment]
+            request.updated_at = utc_timestamp()
+            request.closed_at = closed_at
+            self._write_run(run)
+
+    def _recover_fs_request_result(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        run_id: str,
+        request_id: str,
+        operation: str,
+        deadline: float,
+    ) -> dict[str, Any] | None:
+        while True:
+            try:
+                status = client.invoke(
+                    "fs.request.status",
+                    {"requestId": request_id},
+                )
+            except AgentPosixBridgeError as exc:
+                if exc.code == "RequestNotFound":
+                    return None
+                self._update_fs_request(
+                    run_id,
+                    request_id,
+                    state="needs_recovery",
+                    error={
+                        "message": str(exc),
+                        "code": exc.code,
+                        "delivery": exc.delivery,
+                    },
+                )
+                self._mark_fs_recovery(
+                    run_id,
+                    reason=(
+                        f"cannot inspect outcome of {operation} request {request_id}: "
+                        f"{exc}"
+                    ),
+                )
+                raise RuntimeError(
+                    f"ThinkThreadRequestNeedsRecovery: {request_id}"
+                ) from exc
+            if status.get("requestId") != request_id or status.get("method") != operation:
+                raise RuntimeError(
+                    f"fs.request.status identity mismatch for {request_id}"
+                )
+            state = status.get("state")
+            if state in {"accepted", "running"}:
+                self._update_fs_request(
+                    run_id,
+                    request_id,
+                    state="running" if state == "running" else "accepted",
+                )
+                if time.monotonic() >= deadline:
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="needs_recovery",
+                        error={"message": "request remained non-terminal at deadline"},
+                    )
+                    self._mark_fs_recovery(
+                        run_id,
+                        reason=f"{operation} request {request_id} remained {state}",
+                    )
+                    raise RuntimeError(
+                        f"ThinkThreadRequestNeedsRecovery: {request_id} is {state}"
+                    )
+                time.sleep(0.05)
+                continue
+            if state == "succeeded" or state == "cancelled":
+                result = status.get("result")
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        f"terminal fs request {request_id} omitted result"
+                    )
+                self._update_fs_request(
+                    run_id,
+                    request_id,
+                    state="cancelled" if state == "cancelled" else "succeeded",
+                    result=result,
+                )
+                return result
+            if state == "failed":
+                error = status.get("error")
+                normalized = error if isinstance(error, dict) else {}
+                self._update_fs_request(
+                    run_id,
+                    request_id,
+                    state="failed",
+                    error=normalized,
+                )
+                raise AgentPosixBridgeError(
+                    f"ThinkThread {operation} request failed: {request_id}",
+                    error={"rejection": {"error": normalized}},
+                )
+            self._update_fs_request(
+                run_id,
+                request_id,
+                state="needs_recovery",
+                error={"message": f"request state is {state!r}"},
+            )
+            self._mark_fs_recovery(
+                run_id,
+                reason=f"{operation} request {request_id} is {state!r}",
+            )
+            raise RuntimeError(
+                f"ThinkThreadRequestNeedsRecovery: {request_id} is {state!r}"
+            )
+
     def _settle_process_verifier(
         self,
         *,
