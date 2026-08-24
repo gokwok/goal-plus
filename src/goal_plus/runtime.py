@@ -7384,12 +7384,12 @@ class FileSearchRuntime:
         worker_host: str,
         worker_budget: WorkerBudget | None,
     ) -> None:
-        if worker_host == "pi-rpc" and (
+        if worker_host in {"pi-rpc", "pi-thinkthread"} and (
             worker_budget is None or worker_budget.max_runtime_seconds is None
         ):
             raise ValueError(
-                "pi-rpc worker_budget requires max_runtime_seconds so the "
-                "Pi RPC runner can enforce a process deadline"
+                f"{worker_host} worker_budget requires max_runtime_seconds so the "
+                "Pi host controller can enforce a worker deadline"
             )
         if worker_budget is None:
             return
@@ -7627,9 +7627,20 @@ class FileSearchRuntime:
                 return None
             prompt = payload.get("developer_instructions")
             return prompt if isinstance(prompt, str) and prompt.strip() else None
-        if host != "pi-rpc":
+        if host not in {"pi-rpc", "pi-thinkthread"}:
             return None
-        prompt_path = repository_root / ".pi" / "prompts" / "search-candidate-worker.md"
+        if host == "pi-thinkthread":
+            installed_prompt = os.environ.get("GOAL_PLUS_PI_WORKER_PROMPT")
+            if installed_prompt:
+                prompt_path = Path(installed_prompt).expanduser()
+                if prompt_path.is_file():
+                    return prompt_path.read_text(encoding="utf-8")
+        prompt_name = (
+            "search-candidate-worker-thinkthread.md"
+            if host == "pi-thinkthread"
+            else "search-candidate-worker.md"
+        )
+        prompt_path = repository_root / ".pi" / "prompts" / prompt_name
         if prompt_path.exists():
             return prompt_path.read_text(encoding="utf-8")
         return (
@@ -7755,6 +7766,67 @@ class FileSearchRuntime:
         proposal: CandidateProposal,
         slot: int,
     ) -> CandidateTask:
+        if frozen.spec.strategy.worker_host == "pi-thinkthread":
+            baseline = run.baseline_artifact_ref
+            if not isinstance(baseline, FsSnapshotArtifactRef):
+                raise RuntimeError(
+                    "pi-thinkthread candidate creation requires a baseline FsSnapshot"
+                )
+            instructions = [
+                "你在 ThinkThread private COW branch 中工作；不要访问 Parent 或 sibling filesystem。",
+                "首先调用 search_get_agent_context，并把返回的 run/candidate/session 绑定视为权威。",
+                "只能修改 allowed_files；不得触碰 denied_files 或冻结 verifier 资产。",
+                "所有正确性、约束和指标反馈只能通过 search_run_verifier 获得；不要直接运行任务自带的 grader、runner 或 evaluator。",
+                "首次修改前读取 search_get_global_evidence，此后遵循定期 Evidence 刷新策略。",
+                "每次 verifier settlement 都绑定 exact FsSnapshot；keep/retain 继续当前 branch，discard/failure 后停止当前 turn，等待 Root 完成 TERM、branch reset 和 retained Session wake。",
+                "不要调用 ThinkThread fs API、管理 Child 或执行 Root publication；此 Child Profile 只授予 thinkthread.message。",
+                "运行时结果账本通过 search_get_agent_context 和 search_list_iterations 提供；不要创建或伪造 Git commit。",
+            ]
+            share_out_dir: Path | None = None
+            if frozen.spec.shared_dir.enabled:
+                share_out_dir = Path(SHARE_OUT_RELATIVE_PATH)
+                instructions.extend(
+                    [
+                        f"将待共享工具的源文件放在 {TOOL_DRAFTS_RELATIVE_PATH}/，调用 search_stage_shared_tool 记录 staging；不要把文件内容塞进 Message。",
+                        "只有通过 verifier 的 exact FsSnapshot 才能发布 immutable shared tool；其他 Candidate 通过 search_copy_shared_tool 请求 Root 将工具应用到自己的 snapshot，再由 Root reset branch 并 wake。",
+                        "每次 verifier 提交与 staging inventory 一致的 toolization_decision。",
+                    ]
+                )
+            instructions.extend(proposal.instructions)
+            hypothesis = proposal.hypothesis or proposal.intent or f"候选 {candidate_id}"
+            selected_model = self._selected_model_for_slot(plan, slot)
+            return CandidateTask(
+                run_id=run.run_id,
+                candidate_id=candidate_id,
+                plan_id=plan.plan_id,
+                hypothesis=hypothesis,
+                workspace=None,
+                workspace_backend=None,
+                fs_base_snapshot_id=baseline.snapshot_id,
+                share_out_dir=share_out_dir,
+                allowed_files=frozen.spec.edit_surface.allow,
+                denied_files=frozen.spec.edit_surface.deny,
+                instructions=instructions,
+                expected_artifacts=[],
+                stop_conditions={},
+                proposal=proposal,
+                selected_model=selected_model,
+                model_provenance=(
+                    self._selected_model_provenance(selected_model)
+                    if selected_model
+                    else {}
+                ),
+                strategy_metadata={
+                    "strategy": plan.strategy.name,
+                    "worker_host": "pi-thinkthread",
+                    "worker_policy": plan.worker_policy,
+                    "plan_id": plan.plan_id,
+                    "slot": slot,
+                    "selected_model": selected_model.model if selected_model else None,
+                    "baseline_snapshot_id": baseline.snapshot_id,
+                },
+            )
+
         workspace = self._run_dir(run.run_id) / "workspace" / candidate_id
 
         materialization = materialize_candidate_workspace(
