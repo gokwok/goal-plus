@@ -4716,6 +4716,86 @@ class FileSearchRuntime:
             self._write_run(run)
         self._close_fs_requests_after_evidence(run_id, [request_id], client)
 
+    def _run_pi_thinkthread_verifier(
+        self,
+        *,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        scope: Literal["process", "promotion"],
+        session: AgentSessionRecord | None,
+        hypothesis: str | None,
+        toolization_decision: ToolizationDecision | None,
+        idempotency_key: str | None,
+    ) -> ScoreReport:
+        client = self._agent_posix_client()
+        client.preflight()
+        reader = FsSnapshotArtifactReader(client)
+        if scope == "process":
+            if session is None:
+                raise PermissionError(
+                    "pi-thinkthread process verifier requires a bound Child session"
+                )
+            if any(
+                receipt.target_snapshot_id is None
+                for receipt in record.pending_tool_copies
+            ):
+                raise RuntimeError(
+                    "shared tool copy requires the current Child turn to end before "
+                    "the next verifier attempt"
+                )
+            attempt = self._capture_pi_thinkthread_attempt(
+                client=client,
+                run=run,
+                frozen=frozen,
+                record=record,
+                session=session,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            selected = self._fs_snapshot_ref(
+                run.selected_artifact_ref,
+                field="selected artifact",
+            )
+            baseline = self._fs_snapshot_ref(
+                run.baseline_artifact_ref,
+                field="run baseline",
+            )
+            source_prefix = run.fs_source_relative_path or "."
+            root_paths = reader.changed_files(baseline, selected)
+            changed_files = [
+                self._fs_source_projected_path(source_prefix, path)
+                for path in root_paths
+            ]
+            touched_denied = any(
+                path_matches(path, frozen.spec.edit_surface.deny)
+                for path in changed_files
+            )
+            outside_allowed = any(
+                not path_matches(path, frozen.spec.edit_surface.allow)
+                for path in changed_files
+            )
+            attempt = _FsAttemptState(
+                base_ref=baseline,
+                attempt_ref=selected,
+                changed_files=changed_files,
+                actual_diff=reader.diff(
+                    baseline,
+                    selected,
+                    max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+                ),
+                cumulative_diff=reader.diff(
+                    baseline,
+                    selected,
+                    max_bytes=MAX_EVIDENCE_ANNOTATION_DIFF_BYTES,
+                ),
+                touched_denied_files=touched_denied,
+                changed_outside_allowed=outside_allowed,
+                artifact_hash=reader.canonical_digest(baseline, selected),
+                continuation_required=False,
+            )
+        raise NotImplementedError
+
     def _settle_process_verifier(
         self,
         *,
