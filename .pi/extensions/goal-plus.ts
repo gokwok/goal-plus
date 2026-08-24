@@ -2,9 +2,13 @@ import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-wo
 import { Box, Text } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createHash, randomUUID } from "node:crypto";
 import { type TSchema, Type } from "typebox";
 
 const role = process.env.GOAL_PLUS_PI_ROLE || "main";
+const isThinkThreadProfile = Boolean(process.env.GOAL_PLUS_AGENT_POSIX_SDK_ENTRY);
+const isThinkThreadWorker = role === "worker" && isThinkThreadProfile;
 const runtimeRoot = process.env.GOAL_PLUS_ROOT || ".gp";
 const sourcePath = process.env.GOAL_PLUS_SOURCE_PATH;
 const workerContinueUntilMs = Number(process.env.GOAL_PLUS_PI_WORKER_CONTINUE_UNTIL_MS || "0");
@@ -22,11 +26,20 @@ let activeGoalPlusId = process.env.GOAL_PLUS_ID;
 let cachedGoalStatus: GoalPlusStatusPayload | undefined;
 let continuationCount = 0;
 let workerContinuationCount = 0;
+let workerAgentSessionId: string | undefined;
+let workerMessageCursor: string | undefined;
+let workerRegistrationSent = false;
+let workerSdkModulePromise: Promise<any> | undefined;
+let workerSdkClientPromise: Promise<any> | undefined;
+const workerAcknowledgedDispatches = new Set<string>();
 let activeGoalStartedAt: string | undefined;
 let activeGoalStartEntryCount = 0;
 
 const INSTALL_HINT =
 	'Install this project into the Python environment that launches Pi: python -m pip install -e ".[dev]".';
+const AGENT_POSIX_CONTROL_PROTOCOL_VERSION = 2;
+const AGENT_POSIX_CONTRACT_FINGERPRINT =
+	"fcc80b665cd990f9d1e3681a9d384cb99994f2b739cd4fbddc97bdda01391131";
 const LooseObject = Type.Object({}, { additionalProperties: true });
 const GoalPlusConfidence = Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")]);
 const GoalPlusRecommendedPhase = Type.Union([
@@ -169,7 +182,9 @@ const StrategySpec = Type.Object(
 	{
 		name: Type.Optional(Type.String({ minLength: 1 })),
 		orchestration_mode: Type.Optional(Type.Literal("parallel_loops")),
-		worker_host: Type.Optional(Type.Literal("pi-rpc")),
+		worker_host: Type.Optional(
+			Type.Union([Type.Literal("pi-rpc"), Type.Literal("pi-thinkthread")]),
+		),
 		worker_agent_type: Type.Optional(NullableString),
 		worker_budget: Type.Optional(Type.Union([WorkerBudget, Type.Null()])),
 		worker_launch: Type.Optional(Type.Union([WorkerLaunch, Type.Null()])),
@@ -282,7 +297,11 @@ const RuntimeToolSchemas: Record<string, TSchema> = {
 	),
 	goal_plus_list_models: Type.Object(
 		{
-			host: Type.Union([Type.Literal("codex"), Type.Literal("pi-rpc")]),
+			host: Type.Union([
+				Type.Literal("codex"),
+				Type.Literal("pi-rpc"),
+				Type.Literal("pi-thinkthread"),
+			]),
 			query: Type.Optional(Type.String()),
 		},
 		{ additionalProperties: false },
@@ -396,6 +415,10 @@ const RuntimeToolSchemas: Record<string, TSchema> = {
 		{ additionalProperties: false },
 	),
 	search_status: Type.Object({ run_id: Type.String() }, { additionalProperties: false }),
+	search_recover_pi_thinkthread: Type.Object(
+		{ run_id: Type.String() },
+		{ additionalProperties: false },
+	),
 	search_invalidate_run: Type.Object(
 		{
 			run_id: Type.String(),
@@ -591,18 +614,20 @@ const RuntimeToolDescriptions: Record<string, string> = {
 		"冻结不可变的 SearchSpec 和 verifier bundle。预检使用一次性源码副本，并拒绝 verifier 工作区副作用；并发 Search 下 verifier 临时文件必须放入唯一的 GOAL_PLUS_VERIFIER_TMPDIR/TMPDIR，绝不能使用固定 /tmp 路径。parallel_loops 模式由一份初始 plan 创建长期候选。",
 	search_create:
 		"从 frozen_spec_id 创建 Search run。初始 run 必须省略 source_run_id，或在 strict schema 下传 null；仅在已有真实前驱时传入准确的 run_* ID，绝不能传 initial 或 in_progress。",
+	search_recover_pi_thinkthread:
+		"仅用于 pi-thinkthread 崩溃恢复：按已持久化的 RequestId 查询或幂等重放 Root/Child snapshot capture，绑定准确 FsSnapshotId 后关闭 terminal request。不得创建新 RequestId 盲重试。",
 	search_get_agent_context:
 		"读取当前 worker 的权威 candidate 上下文。candidate_task.share_out_dir 非空表示已启用 shared_dir：同一 run 内可供 peer 使用的 repeated_sequence、domain_probe、parser_or_trace 或 peer_setup_reduction 默认应工具化；短小、任务专属、来自临时代码片段或只输出退出码都不是排除理由。只有 single_common_command、logic_free_wrapper、restricted_artifact、candidate_private_state 或 duplicate_snapshot 支持 not_applicable。",
 	search_get_global_evidence:
-		"读取当前 run 的窄 Global Evidence 视图。每项包含 verifier attempt commit、硬 score、keep/retain/discard/failure disposition、可能延迟的客观 View、可选 supplemental evaluation 的可用标记，以及启用 shared_dir 后已由 annotator 描述并由 runtime 绑定的 shared_tools/tool_view。任一 View 为 null 时都无需等待，可先依据 Evidence 独立探索。",
+		"读取当前 run 的窄 Global Evidence 视图。每项包含 verifier exact ArtifactRef、硬 score、keep/retain/discard/failure disposition、可能延迟的客观 View、可选 supplemental evaluation 的可用标记，以及启用 shared_dir 后已由 annotator 描述并由 runtime 绑定的 shared_tools/tool_view。任一 View 为 null 时都无需等待，可先依据 Evidence 独立探索。",
 	search_copy_shared_tool:
-		"将已出现在 Global Evidence 的 Tool View 所对应的精确 shared-dir 快照复制到当前 candidate 的本地临时 inbox。下一次 worker verifier 会原子消费 receipt 并记录采用；复制本身不改变选择、排名或硬分。",
+		"请求采用 Global Evidence Tool View 对应的精确 shared-dir 快照。pi-thinkthread 只先持久化 receipt；当前 turn 结束后 Root 停止 execution、patch/reset private branch 并 wake 同一 Session。下一次 verifier 消费 receipt；采用本身不改变选择、排名或硬分。",
 	search_stage_shared_tool:
-		"把当前 candidate 的 .tmp/tool-drafts/ 中显式选择的文件安全复制到 .tmp/share-out 的最小工具目录。该工具只负责 staging；路径、链接和 frozen shared-dir 限额由 runtime 校验，发布仍要求归属于当前 worker 且通过的 process verifier。",
+		"登记当前 candidate 的 .tmp/tool-drafts/ 中显式选择的文件。pi-thinkthread 不在 Child 创建本地共享目录；Root 在下一次 exact snapshot verifier 结算时读取并发布。路径、链接和 frozen shared-dir 限额由 runtime 校验，发布仍要求归属于当前 worker 且通过的 process verifier。",
 	search_get_evidence_detail:
 		"按需展开一条已结算 Evidence 的 supplemental evaluation。仅当 agent context 声明该能力开启且目标行 supplemental_available=true 时调用；independent 模式只允许读取自己的 candidate。",
 	search_run_verifier:
-		"为一个候选评分。worker process verifier 必须提供一句话 hypothesis，并在 shared_dir 启用时提交 toolization_decision：staged 至少包含一个正向 signal 和实际 tool_names；not_applicable 必须给出具体 exclusion，不能只写不复用。runtime 以 staging inventory 和 publication settlement 为权威，只把 toolization_review_missing、toolization_stage_missing 或 toolization_decision_mismatch 记录为 monitor/report advisory；它们不改变结算、硬 score、选择或 promotion。工具化目标仅是降低同一 run 内 peer 重建诊断流程的成本，不要求跨项目通用。每份报告都会在运行时拥有、继承而来的 workspace/results.tsv 中追加且只追加一条已验证记录，并提交该文件。process verifier 返回 keep/retain/discard/failure disposition；严格改善为 keep，同分为 retain 并成为 candidate-local 最新基线，只有退化或验证失败时恢复此前硬分最佳。开放式补充评价和动态 peer 比较不改变结算、硬 score 或最终 PASS/FAIL。带 candidate_action=stop_and_report 的 VerifierWorkspaceSideEffect 属于基础设施失败：worker 必须停止，不能清理或重试，使父级能够修复并重新冻结。",
+		"为一个候选评分。worker process verifier 必须提供一句话 hypothesis，并在 shared_dir 启用时提交 toolization_decision：staged 至少包含一个正向 signal 和实际 tool_names；not_applicable 必须给出具体 exclusion，不能只写不复用。runtime 以 exact ArtifactRef、staging inventory 和 publication settlement 为权威；Git host 保留兼容 ledger，pi-thinkthread 不创建 commit 或 results.tsv。toolization_review_missing、toolization_stage_missing 或 toolization_decision_mismatch 只记为 monitor/report advisory，不改变结算或硬分。process verifier 返回 keep/retain/discard/failure disposition；严格改善为 keep，同分为 retain 并成为 candidate-local 最新基线，只有退化或验证失败时恢复此前硬分最佳。开放式补充评价和动态 peer 比较不改变结算、硬 score 或最终 PASS/FAIL。带 candidate_action=stop_and_report 的 VerifierWorkspaceSideEffect 属于基础设施失败：worker 必须停止，不能清理或重试，使父级能够修复并重新冻结。",
 	search_invalidate_run:
 		"主 agent 确认 verifier 契约、覆盖范围、确定性、目标对齐或基础设施失败后，原子地隔离该 run。随后中断每个 host worker，等待 active worker 数归零，修复并重新冻结，再使用 source_run_id 创建后继项。",
 	search_report:
@@ -721,6 +746,10 @@ function sourceRoot(ctx: CommandRuntimeContext): string {
 }
 
 function projectModuleInvocation(ctx: CommandRuntimeContext, command: string, moduleName: string): CommandInvocation {
+	const installedCommand = process.env.GOAL_PLUS_PI_TOOL;
+	if (command === "goal-plus-pi-tool" && installedCommand) {
+		return { command: installedCommand, argsPrefix: [], label: installedCommand };
+	}
 	const root = sourceRoot(ctx);
 	const src = join(root, "src");
 	const packageDir = join(src, "goal_plus");
@@ -1236,6 +1265,14 @@ async function updateGoalPlusStart(
 async function resumeGoalPlusStart(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
+	if (isThinkThreadProfile) {
+		lines.push(
+			"",
+			"ThinkThread Profile contract：",
+			"- SearchSpec 使用 worker_host=pi-thinkthread 并省略 workspace。",
+			"- Candidate 只通过 Message-backed tools 访问 Root runtime；不要启动 legacy Pi RPC worker。",
+		);
+	}
 ): Promise<string | undefined> {
 	if (!activeGoalPlusId) {
 		ctx.ui.notify("No interrupted Goal Plus record to resume", "error");
@@ -1374,6 +1411,12 @@ function workspaceGuard(event: ToolCallEvent) {
 	}
 	if (!workspaceRoot) return undefined;
 	if (!["edit", "write", "bash"].includes(event.toolName)) return undefined;
+	if (isThinkThreadProfile) {
+		lines.push(
+			"- 当前是 ThinkThread Root Profile：冻结 SearchSpec 时必须使用 strategy.worker_host=\"pi-thinkthread\"，并完全省略 workspace 字段。不要使用 pi-rpc、Git worktree、goal-plus-pi-worker 或 pi --mode rpc Candidate 链路。",
+			"- Worker 模型发现使用 goal_plus_list_models(host=\"pi-thinkthread\")；只使用 Profile 实际 delegated 的 exact provider/model。reasoning effort 和 service tier 不受支持。",
+		);
+	}
 	const target = extractCandidatePath(event);
 	if (target && target.includes("..")) {
 		return { block: true, reason: "workspaceGuard blocked parent-directory path." };
@@ -1406,7 +1449,7 @@ let piForGate: ExtensionAPI;
 
 export default function (pi: ExtensionAPI) {
 	piForGate = pi;
-	if (typeof pi.registerEntryRenderer === "function") {
+	if (role === "main" && typeof pi.registerEntryRenderer === "function") {
 		pi.registerEntryRenderer<GoalPlusStatsEntry>(GOAL_PLUS_STATS_ENTRY_TYPE, (entry, { expanded }, theme) => {
 			const data = entry.data;
 			const lines = (data?.message ?? "Goal Plus stats").split("\n");
@@ -1419,7 +1462,7 @@ export default function (pi: ExtensionAPI) {
 			return box;
 		});
 	}
-	if (!isPrintLikeInvocation) {
+	if (role === "main" && !isPrintLikeInvocation) {
 		pi.registerCommand("goal-plus", {
 			description: "运行、编辑或恢复原生 Pi Goal Plus（支持显式角色模型）",
 			handler: async (args, ctx) => {
@@ -1495,7 +1538,8 @@ export default function (pi: ExtensionAPI) {
 	const finalCheckerTools = ["goal_plus_status", "goal_plus_submit_final_check"];
 	const roleTools = role === "worker" ? workerTools : role === "final-checker" ? finalCheckerTools : mainTools;
 	for (const tool of roleTools) {
-		registerRuntimeTool(pi, tool);
+		if (isThinkThreadWorker) registerWorkerMessageTool(pi, tool);
+		else registerRuntimeTool(pi, tool);
 	}
 	if (role === "main") registerPiFinalCheckTool(pi);
 	pi.on("input", async (event, ctx) => {
@@ -1541,6 +1585,43 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, ctx) => {
 		if (role !== "main" || !activeGoalPlusId) return;
 		const commandCtx = commandContextFrom(ctx);
+function registerWorkerMessageTool(pi: ExtensionAPI, name: string) {
+	pi.registerTool({
+		name,
+		label: name,
+		description:
+			RuntimeToolDescriptions[name] ??
+			`通过 ThinkThread Message 向 Root 请求 Goal Plus 工具 ${name}。`,
+		parameters: toolParameters(name),
+		executionMode: "sequential",
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			try {
+				const result = await runWorkerMessageRpc(
+					name,
+					params as Record<string, unknown>,
+					ctx,
+					signal,
+				);
+				if (name === "search_get_agent_context") {
+					workspaceRoot = process.cwd();
+					sawContext = true;
+				}
+				return result;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					content: [{ type: "text" as const, text: message }],
+					details: {
+						tool: name,
+						ok: false,
+						error: message,
+					},
+				};
+			}
+		},
+	});
+}
+
 		const status = await refreshActiveGoal(pi, commandCtx, canPersistGoalState(ctx.mode));
 		if (!status || isTerminalStatus(status.status)) return;
 		return {
@@ -1625,3 +1706,11 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 }
+		"search_recover_pi_thinkthread",
+		if (isThinkThreadProfile) await validateThinkThreadRole(ctx);
+		if (role === "worker") return;
+		if (isThinkThreadWorker) {
+			await acknowledgeWorkerDispatch(ctx);
+			return;
+		}
+		if (role === "worker") return;
