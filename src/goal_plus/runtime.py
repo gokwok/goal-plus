@@ -6406,6 +6406,10 @@ class FileSearchRuntime:
             )
         run = self._load_run(run_id)
         frozen = self._load_frozen_spec(run.frozen_spec_id)
+        snapshot_cleanup: dict[str, Any] | None = None
+        if frozen.spec.strategy.worker_host == "pi-thinkthread":
+            snapshot_cleanup = self.cleanup_pi_thinkthread_snapshots(run_id)
+            run = self._load_run(run_id)
         records = self._load_candidate_records(run_id)
         plans = self._load_plans(run_id)
         report_path = self._run_dir(run_id) / "report.md"
@@ -6426,13 +6430,38 @@ class FileSearchRuntime:
             f"- Best score: `{run.best_score}`",
             f"- Selected score: `{run.selected_score}`",
             f"- Selected iteration: `{run.selected_iteration}`",
+            (
+                "- Selected artifact: `"
+                + (
+                    canonical_json(
+                        run.selected_artifact_ref.model_dump(mode="json")
+                    )
+                    if run.selected_artifact_ref is not None
+                    else ""
+                )
+                + "`"
+            ),
             f"- Selected git head: `{run.selected_git_head}`",
+            (
+                "- Publication: `"
+                + (run.publication.state if run.publication is not None else "")
+                + "`"
+            ),
             f"- Invalidated at: `{run.invalidated_at}`",
             f"- Invalidation reason: `{run.invalidation_reason}`",
             f"- Invalidation summary: {run.invalidation_summary or ''}",
             (
                 "- Invalidation evidence: "
                 f"{self._markdown_cell(canonical_json(run.invalidation_evidence))}"
+            ),
+            (
+                "- ThinkThread snapshot cleanup: `"
+                + (
+                    canonical_json(snapshot_cleanup)
+                    if snapshot_cleanup is not None
+                    else ""
+                )
+                + "`"
             ),
             "",
             "## Strategy Plans",
@@ -6454,16 +6483,26 @@ class FileSearchRuntime:
                 "",
                 "## Candidates",
                 "",
-                "| Candidate | Plan | Agent Sessions | Parent/Base | Status | Score | Git Head | Best Iteration | Best Score | Best Git Head | Process | Summary | Key Metrics | Changed Files | Results Ledger |",
-                "|---|---|---|---|---|---:|---|---:|---:|---|---|---|---|---|---|",
+                "| Candidate | Plan | Agent Sessions | Parent/Base | Status | Score | Artifact | Git Head | Best Iteration | Best Score | Best Artifact | Best Git Head | Process | Summary | Key Metrics | Changed Files | Results Ledger |",
+                "|---|---|---|---|---|---:|---|---|---:|---:|---|---|---|---|---|---|---|",
             ]
         )
-        ledger_summaries: list[tuple[CandidateRecord, Path, list[ResultLedgerEntry]]] = []
+        ledger_summaries: list[
+            tuple[CandidateRecord, Path | None, list[ResultLedgerEntry]]
+        ] = []
         for record in records:
             score = ""
             passed = ""
             latest_iteration = record.iterations[-1] if record.iterations else None
             git_head = latest_iteration.git_head if latest_iteration else ""
+            artifact_ref = (
+                latest_iteration.attempt_ref if latest_iteration is not None else None
+            )
+            artifact_display = (
+                canonical_json(artifact_ref.model_dump(mode="json"))
+                if artifact_ref is not None
+                else ""
+            )
             payload = self._history_candidate_payload(record, frozen.spec)
             key_metrics = ", ".join(
                 f"{key}={value}" for key, value in payload["key_metrics"].items()
@@ -6492,6 +6531,13 @@ class FileSearchRuntime:
                 else str(best_iteration.score)
             )
             best_git_head = "" if best_iteration is None else best_iteration.git_head or ""
+            best_artifact = (
+                ""
+                if best_iteration is None or best_iteration.attempt_ref is None
+                else canonical_json(
+                    best_iteration.attempt_ref.model_dump(mode="json")
+                )
+            )
             parent_base = ", ".join(
                 part
                 for part in [
@@ -6500,24 +6546,33 @@ class FileSearchRuntime:
                 ]
                 if part
             )
-            results_path = self._results_tsv_path(record.task.workspace)
-            results_entries = self._read_results_tsv(record)
-            ledger_summaries.append((record, results_path, results_entries))
-            try:
-                ledger_link = results_path.relative_to(report_path.parent).as_posix()
-            except ValueError:
-                ledger_link = results_path.as_posix()
-            ledger_display = (
-                f"[results.tsv]({ledger_link}) ({len(results_entries)} rows)"
-                if results_path.is_file()
-                else "missing"
+            results_path = (
+                self._results_tsv_path(record.task.workspace)
+                if record.task.workspace is not None
+                else None
             )
+            results_entries = self._candidate_results_ledger(record)
+            ledger_summaries.append((record, results_path, results_entries))
+            if results_path is not None and results_path.is_file():
+                try:
+                    ledger_link = results_path.relative_to(report_path.parent).as_posix()
+                except ValueError:
+                    ledger_link = results_path.as_posix()
+                ledger_display = (
+                    f"[results.tsv]({ledger_link}) ({len(results_entries)} rows)"
+                )
+            elif record.results_ledger:
+                ledger_display = f"durable ledger ({len(results_entries)} rows)"
+            else:
+                ledger_display = "missing"
             lines.append(
                 f"| `{record.candidate_id}` | `{record.task.plan_id or ''}` | "
                 f"{self._markdown_cell(agent_sessions)} | "
                 f"{self._markdown_cell(parent_base)} | {record.status} | {score} | "
+                f"{self._markdown_cell(artifact_display)} | "
                 f"{self._markdown_cell(git_head or '')} | "
                 f"{best_iteration_value} | {best_score_value} | "
+                f"{self._markdown_cell(best_artifact)} | "
                 f"{self._markdown_cell(best_git_head)} | {passed} | "
                 f"{self._markdown_cell(payload['summary'])} | "
                 f"{self._markdown_cell(key_metrics)} | {self._markdown_cell(changed)} | "
@@ -6528,25 +6583,34 @@ class FileSearchRuntime:
                 "",
                 "## Results Ledgers",
                 "",
-                "Each candidate workspace owns the complete inherited verifier ledger.",
+                "Each candidate owns a durable inherited verifier ledger. Git-backed candidates also materialize results.tsv in their workspace.",
                 "",
-                "| Candidate | Ledger | Rows | Latest Commit | Latest Score | Latest Status | Latest Hypothesis |",
-                "|---|---|---:|---|---:|---|---|",
+                "| Candidate | Ledger | Rows | Latest Artifact | Latest Commit | Latest Score | Latest Status | Latest Hypothesis |",
+                "|---|---|---:|---|---|---:|---|---|",
             ]
         )
         for record, results_path, results_entries in ledger_summaries:
             latest = results_entries[-1] if results_entries else None
-            try:
-                ledger_link = results_path.relative_to(report_path.parent).as_posix()
-            except ValueError:
-                ledger_link = results_path.as_posix()
-            ledger_display = (
-                f"[results.tsv]({ledger_link})" if results_path.is_file() else "missing"
+            if results_path is not None and results_path.is_file():
+                try:
+                    ledger_link = results_path.relative_to(report_path.parent).as_posix()
+                except ValueError:
+                    ledger_link = results_path.as_posix()
+                ledger_display = f"[results.tsv]({ledger_link})"
+            elif record.results_ledger:
+                ledger_display = "durable ledger"
+            else:
+                ledger_display = "missing"
+            latest_artifact = (
+                canonical_json(latest.artifact_ref.model_dump(mode="json"))
+                if latest is not None and latest.artifact_ref is not None
+                else ""
             )
             lines.append(
                 f"| `{record.candidate_id}` | {self._markdown_cell(ledger_display)} | "
                 f"{len(results_entries)} | "
-                f"{self._markdown_cell(latest.git_head if latest else '')} | "
+                f"{self._markdown_cell(latest_artifact)} | "
+                f"{self._markdown_cell((latest.git_head if latest else '') or '')} | "
                 f"{'' if latest is None or latest.score is None else latest.score} | "
                 f"{self._markdown_cell(latest.status if latest else '')} | "
                 f"{self._markdown_cell(latest.hypothesis if latest else '')} |"
@@ -6636,6 +6700,8 @@ class FileSearchRuntime:
                 "cannot promote candidate before search_select selects it"
             )
         frozen = self._load_frozen_spec(run.frozen_spec_id)
+        if frozen.spec.strategy.worker_host == "pi-thinkthread":
+            return self._promote_pi_thinkthread(run_id, candidate_id, frozen)
 
         def reject_promotion(message: str) -> None:
             latest_run = self._load_run(run_id)
@@ -6712,9 +6778,12 @@ class FileSearchRuntime:
             )
             git_head = self._git_head(record.task.workspace)
             evidence = record.promotion_evidence
+            selected_ref = GitCommitArtifactRef(commit=run.selected_git_head)
             evidence_is_current = bool(
                 evidence
                 and evidence.candidate_id == candidate_id
+                and evidence.selected_artifact_ref == selected_ref
+                and evidence.artifact_ref == selected_ref
                 and evidence.selected_git_head == run.selected_git_head
                 and evidence.git_head == run.selected_git_head
                 and evidence.artifact_hash == artifact_hash
