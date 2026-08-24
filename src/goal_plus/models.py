@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -27,6 +27,7 @@ class RunState(str, Enum):
     SELECTION_BLOCKED = "selection_blocked"
     READY_TO_PROMOTE = "ready_to_promote"
     PROMOTED = "promoted"
+    NEEDS_RECOVERY = "needs_recovery"
     ABORTED = "aborted"
     FAILED = "failed"
 
@@ -102,7 +103,23 @@ class EditSurface(SearchModel):
     max_file_changes: int | None = Field(default=None, gt=0)
 
 
-AgentHostKind = Literal["codex", "pi-rpc"]
+AgentHostKind = Literal["codex", "pi-rpc", "pi-thinkthread"]
+
+
+class GitCommitArtifactRef(SearchModel):
+    kind: Literal["git_commit"] = "git_commit"
+    commit: str = Field(min_length=1)
+
+
+class FsSnapshotArtifactRef(SearchModel):
+    kind: Literal["fs_snapshot"] = "fs_snapshot"
+    snapshot_id: str = Field(pattern=r"^fsnap-[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+ArtifactRef = Annotated[
+    GitCommitArtifactRef | FsSnapshotArtifactRef,
+    Field(discriminator="kind"),
+]
 
 
 class AgentHostHandle(SearchModel):
@@ -285,7 +302,21 @@ class SupplementalDimension(SearchModel):
 class EvidenceComparisonReference(SearchModel):
     candidate_id: str = Field(min_length=1)
     iteration: int = Field(ge=1)
-    commit: str = Field(min_length=1)
+    artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    commit: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
+
+    @model_validator(mode="after")
+    def require_artifact_identity(self) -> "EvidenceComparisonReference":
+        if self.artifact_ref is None and self.commit is None:
+            raise ValueError("comparison Evidence requires artifact_ref or commit")
+        return self
 
 
 class PeerComparison(EvidenceComparisonReference):
@@ -368,8 +399,22 @@ class ToolViewRef(SearchModel):
 
 class ToolViewRecord(ToolViewRef):
     snapshot_hash: str = Field(min_length=1)
-    source_commit: str = Field(min_length=1)
+    source_artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    source_commit: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     evidence_scope: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def require_source_artifact(self) -> "ToolViewRecord":
+        if self.source_artifact_ref is None and self.source_commit is None:
+            raise ValueError("Tool View requires a source artifact")
+        return self
 
 
 class ToolAdoptionRecord(SearchModel):
@@ -389,20 +434,59 @@ class ToolAdoptionRecord(SearchModel):
 
 class ToolCopyReceipt(SearchModel):
     receipt_id: str = Field(min_length=1)
+    rpc_request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     tool_id: str = Field(min_length=1)
     snapshot_hash: str = Field(min_length=1)
+    source_artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     source_commit: str | None = None
     agent_session_id: str = Field(min_length=1)
-    candidate_base_git_head: str = Field(min_length=1)
-    inbox_path: Path
+    candidate_base_artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    candidate_base_git_head: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
+    inbox_path: Path | None = None
+    target_snapshot_id: str | None = Field(
+        default=None,
+        pattern=r"^fsnap-[A-Za-z0-9][A-Za-z0-9_-]*$",
+        exclude_if=lambda value: value is None,
+    )
     copied_at: str
+
+    @model_validator(mode="after")
+    def require_candidate_base(self) -> "ToolCopyReceipt":
+        if (
+            self.candidate_base_artifact_ref is None
+            and self.candidate_base_git_head is None
+        ):
+            raise ValueError("tool copy receipt requires a candidate base artifact")
+        return self
 
 
 class EvidenceViewRecord(SearchModel):
     run_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
     iteration: int = Field(ge=1)
-    attempt_commit: str = Field(min_length=1)
+    attempt_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    attempt_commit: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     description: str = Field(min_length=1, max_length=1000)
     supplemental_evaluation: SupplementalEvaluation | None = None
     comparison_basis: list[EvidenceComparisonReference] = Field(
@@ -421,13 +505,33 @@ class EvidenceViewRecord(SearchModel):
             raise ValueError("evidence view description must be one line")
         return " ".join(value.strip().split())
 
+    @model_validator(mode="after")
+    def require_attempt_artifact(self) -> "EvidenceViewRecord":
+        if self.attempt_ref is None and self.attempt_commit is None:
+            raise ValueError("Evidence View requires an attempt artifact")
+        return self
+
 
 class GlobalEvidenceViewReference(SearchModel):
     candidate_id: str = Field(min_length=1)
     iteration: int = Field(ge=1)
-    commit: str = Field(min_length=1)
+    artifact_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    commit: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     view_created_at: str
     supplemental_evaluation_present: bool = False
+
+    @model_validator(mode="after")
+    def require_artifact_identity(self) -> "GlobalEvidenceViewReference":
+        if self.artifact_ref is None and self.commit is None:
+            raise ValueError("Global Evidence reference requires an artifact")
+        return self
 
 
 class GlobalEvidenceReadRecord(SearchModel):
@@ -457,8 +561,24 @@ class EvidenceAnnotationTask(SearchModel):
     run_id: str = Field(min_length=1)
     candidate_id: str = Field(min_length=1)
     iteration: int = Field(ge=1)
-    attempt_base_commit: str = Field(min_length=1)
-    attempt_commit: str = Field(min_length=1)
+    attempt_base_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    attempt_ref: ArtifactRef | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    attempt_base_commit: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
+    attempt_commit: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+    )
     attempt_changed_files: list[str] = Field(default_factory=list)
     task_context_source: Literal[
         "goal_plus_raw_goal",
@@ -488,6 +608,14 @@ class EvidenceAnnotationTask(SearchModel):
     view: EvidenceViewRecord | None = None
     created_at: str
     updated_at: str
+
+    @model_validator(mode="after")
+    def require_attempt_artifacts(self) -> "EvidenceAnnotationTask":
+        if self.attempt_base_ref is None and self.attempt_base_commit is None:
+            raise ValueError("annotation task requires a base artifact")
+        if self.attempt_ref is None and self.attempt_commit is None:
+            raise ValueError("annotation task requires an attempt artifact")
+        return self
 
 
 class StrategySpec(SearchModel):
