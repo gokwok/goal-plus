@@ -469,3 +469,282 @@ class FakeVerifierAgentPosixClient(FakeRootAgentPosixClient):
             return {}
         raise AssertionError(operation)
 
+    def _file(self, snapshot_id: str, path: str) -> bytes:
+        if path == "evaluator.py":
+            return (self.project / path).read_bytes()
+        if path == "initial_program.py":
+            return (
+                b"VALUE = 1\n"
+                if snapshot_id == "fsnap-attempt"
+                else b"VALUE = 0\n"
+            )
+        if path == ".tmp/tool-drafts/probe.py":
+            return b"def probe(value):\n    return value + 1\n"
+        raise AssertionError((snapshot_id, path))
+
+
+class StatefulPoolAgentPosixClient(FakeVerifierAgentPosixClient):
+    def __init__(self, project: Path) -> None:
+        super().__init__(project)
+        self.messages: dict[str, list[dict]] = {}
+        self.sent_messages: list[dict] = []
+        self.branch_states: dict[str, dict] = {}
+        self.snapshot_index = 0
+        self.message_index = 0
+        self.run_scores: list[float] = []
+        self.drop_execution_on_snapshot = False
+        self.spawn_completion_unknown_once = False
+        self.wake_completion_unknown_once = False
+        self.wait_timeouts_before_absent = 0
+        self.wait_rejections_before_absent = 0
+        self.reset_blocked_once = False
+        self.branch_snapshot_terminal_failure_once = False
+
+    def set_child_absent(self, child_id: str, *, failed: bool = False) -> None:
+        child = self._child(child_id)
+        child["executionState"] = "absent"
+        child["agentState"] = "failed" if failed else "ready"
+        child["completion"] = {"kind": "completed", "summary": "turn ended"}
+
+    def enqueue(self, child_id: str, payload: dict, *, sender: str | None = None) -> str:
+        self.message_index += 1
+        message_id = f"msg-worker-{self.message_index}"
+        self.messages.setdefault(child_id, []).append(
+            {
+                "messageId": message_id,
+                "senderThinkthreadId": sender or child_id,
+                "text": json.dumps(payload, separators=(",", ":")),
+                "truncated": False,
+            }
+        )
+        return message_id
+
+    def _child(self, child_id: str) -> dict:
+        return next(
+            child
+            for child in self.children
+            if child.get("thinkthreadId") == child_id
+        )
+
+    def invoke(self, operation: str, params=None, **kwargs):
+        normalized = dict(params or {})
+        if operation == "thinkthread.spawn":
+            result = super().invoke(operation, normalized, **kwargs)
+            branch_id = result["fs"]["fsBranchId"]
+            self.messages[result["thinkthreadId"]] = []
+            self.branch_states[branch_id] = {
+                "branchId": branch_id,
+                "thinkthreadId": result["thinkthreadId"],
+                "baseSnapshotId": normalized["fsSnapshotId"],
+                "controlGeneration": 0,
+                "state": "attached",
+                "storage": {},
+            }
+            if self.spawn_completion_unknown_once:
+                self.spawn_completion_unknown_once = False
+                from goal_plus.thinkthread_agent_posix import AgentPosixBridgeError
+
+                raise AgentPosixBridgeError(
+                    "spawn response was lost",
+                    error={"delivery": "completion_unknown"},
+                )
+            return result
+        if operation == "thinkthread.get":
+            self.operations.append((operation, normalized))
+            child_id = normalized["id"]
+            try:
+                return dict(self._child(child_id))
+            except StopIteration as exc:
+                from goal_plus.thinkthread_agent_posix import AgentPosixBridgeError
+
+                raise AgentPosixBridgeError(
+                    "child missing",
+                    error={
+                        "response": {
+                            "error": {
+                                "code": "ThinkThreadNotFound",
+                                "message": "child missing",
+                            }
+                        }
+                    },
+                ) from exc
+        if operation == "message.receive":
+            self.operations.append((operation, normalized))
+            child_id = normalized["senderThinkthreadId"]
+            after = int(normalized.get("after") or 0)
+            queued = self.messages.get(child_id, [])
+            retained = queued[after : after + int(normalized.get("limit", 64))]
+            return {
+                "messages": [dict(message) for message in retained],
+                "nextCursor": str(after + len(retained)),
+            }
+        if operation == "message.send":
+            self.operations.append((operation, normalized))
+            self.sent_messages.append(normalized)
+            self.message_index += 1
+            if normalized.get("wake") is True:
+                child = self._child(normalized["recipientThinkthreadId"])
+                child["executionState"] = "running"
+                child["agentState"] = "busy"
+                if self.wake_completion_unknown_once:
+                    self.wake_completion_unknown_once = False
+                    from goal_plus.thinkthread_agent_posix import AgentPosixBridgeError
+
+                    raise AgentPosixBridgeError(
+                        "wake response was lost",
+                        error={"delivery": "completion_unknown"},
+                    )
+            return {"messageId": f"msg-root-{self.message_index}"}
+        if operation == "fs.branch.snapshot":
+            self.operations.append((operation, normalized))
+            if self.branch_snapshot_terminal_failure_once:
+                self.branch_snapshot_terminal_failure_once = False
+                from goal_plus.thinkthread_agent_posix import AgentPosixBridgeError
+
+                request_id = normalized["requestId"]
+                error = {
+                    "code": "FsSnapshotCaptureFailed",
+                    "message": "branch snapshot capture failed",
+                }
+                self.fs_request_status[request_id] = {
+                    "requestId": request_id,
+                    "method": "fs.branch.snapshot",
+                    "state": "failed",
+                    "acceptedAtUnixMs": 1,
+                    "finishedAtUnixMs": 2,
+                    "result": None,
+                    "error": error,
+                }
+                raise AgentPosixBridgeError(
+                    "branch snapshot capture failed",
+                    error={"response": {"error": error}},
+                )
+            self.snapshot_index += 1
+            result = {
+                "snapshotId": f"fsnap-attempt-{self.snapshot_index}",
+                "ownerThinkthreadId": "tt-root",
+                "createdFromBranchId": normalized["branchId"],
+                "createdAtUnixMs": 2 + self.snapshot_index,
+                "logicalBytes": 20,
+            }
+            self.snapshots.add(result["snapshotId"])
+            if self.drop_execution_on_snapshot:
+                branch = self.branch_states[normalized["branchId"]]
+                self.set_child_absent(branch["thinkthreadId"])
+                self.drop_execution_on_snapshot = False
+            return result
+        if operation == "fs.run" and self.run_scores:
+            self.operations.append((operation, normalized))
+            self.run_params.append(normalized)
+            payload = json.dumps(
+                {"combined_score": self.run_scores.pop(0)}
+            ) + "\n"
+            return {
+                "exit": {"kind": "code", "code": 0},
+                "outputChunks": [
+                    {
+                        "sequence": 0,
+                        "stream": "stdout",
+                        "dataBase64": base64.b64encode(payload.encode()).decode(
+                            "ascii"
+                        ),
+                    }
+                ],
+                "outputTruncated": False,
+                "retainedOutputBytes": len(payload),
+                "observedOutputBytes": len(payload),
+                "runKey": f"run-key-{len(self.run_params)}",
+                "metrics": {},
+            }
+        if operation == "fs.branch.stat":
+            self.operations.append((operation, normalized))
+            return dict(self.branch_states[normalized["branchId"]])
+        if operation == "fs.branch.reset":
+            self.operations.append((operation, normalized))
+            if self.reset_blocked_once:
+                self.reset_blocked_once = False
+                from goal_plus.thinkthread_agent_posix import AgentPosixBridgeError
+
+                raise AgentPosixBridgeError(
+                    "branch reset blocked",
+                    error={
+                        "response": {
+                            "error": {
+                                "code": "FsResetBlocked",
+                                "message": "branch reset blocked",
+                            }
+                        }
+                    },
+                )
+            branch = self.branch_states[normalized["branchId"]]
+            assert branch["controlGeneration"] == normalized["ifGeneration"]
+            branch["baseSnapshotId"] = normalized["toSnapshotId"]
+            branch["controlGeneration"] += 1
+            return dict(branch)
+        if operation == "workflow.fs.snapshot.patchBytes":
+            self.operations.append((operation, normalized))
+            self.snapshot_index += 1
+            snapshot_id = f"fsnap-patched-{self.snapshot_index}"
+            self.snapshots.add(snapshot_id)
+            return {
+                "requestId": normalized["requestId"],
+                "snapshot": {
+                    "snapshotId": snapshot_id,
+                    "ownerThinkthreadId": "tt-root",
+                    "createdAtUnixMs": 20 + self.snapshot_index,
+                    "logicalBytes": 40,
+                },
+            }
+        if operation == "fs.branch.remove":
+            self.operations.append((operation, normalized))
+            branch = self.branch_states[normalized["branchId"]]
+            assert branch["controlGeneration"] == normalized["ifGeneration"]
+            branch["state"] = "removed"
+            branch["controlGeneration"] += 1
+            return dict(branch)
+        if operation == "thinkthread.signal":
+            self.operations.append((operation, normalized))
+            return {}
+        if operation == "thinkthread.wait":
+            self.operations.append((operation, normalized))
+            if self.wait_rejections_before_absent > 0:
+                self.wait_rejections_before_absent -= 1
+                from goal_plus.thinkthread_agent_posix import AgentPosixBridgeError
+
+                raise AgentPosixBridgeError(
+                    "wait timed out",
+                    error={
+                        "response": {
+                            "error": {
+                                "code": "WaitTimeout",
+                                "message": "wait timed out",
+                            }
+                        }
+                    },
+                )
+            if self.wait_timeouts_before_absent > 0:
+                self.wait_timeouts_before_absent -= 1
+                return {
+                    "child": dict(self._child(normalized["id"])),
+                    "timedOut": True,
+                }
+            self.set_child_absent(normalized["id"])
+            return {"child": dict(self._child(normalized["id"]))}
+        if operation == "thinkthread.destroy":
+            self.operations.append((operation, normalized))
+            self.children = [
+                child
+                for child in self.children
+                if child.get("thinkthreadId") != normalized["id"]
+            ]
+            return {}
+        return super().invoke(operation, normalized, **kwargs)
+
+    def _file(self, snapshot_id: str, path: str) -> bytes:
+        if path == "initial_program.py" and snapshot_id.startswith(
+            ("fsnap-attempt-", "fsnap-patched-")
+        ):
+            return b"VALUE = 1\n"
+        return super()._file(snapshot_id, path)
+
+
