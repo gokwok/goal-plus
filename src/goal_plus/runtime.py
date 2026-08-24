@@ -2210,8 +2210,116 @@ class FileSearchRuntime:
                     max_depth=limits.max_depth,
                 )
 
+    def _stage_pi_thinkthread_shared_tool(
+        self,
+        *,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        name: str,
+        summary: str,
+        entrypoint: str,
+        candidate_relative_source_paths: list[str],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_name = " ".join(name.split()).strip()
+        normalized_summary = " ".join(summary.split()).strip()
+        normalized_entrypoint = entrypoint.strip()
+        if not normalized_name or len(normalized_name) > 120:
+            raise ValueError("tool name must contain 1-120 characters")
+        if not normalized_summary or len(normalized_summary) > 500:
+            raise ValueError("tool summary must contain 1-500 characters")
+        if not normalized_entrypoint or len(normalized_entrypoint) > 300:
+            raise ValueError("tool entrypoint must contain 1-300 characters")
+        limits = frozen.spec.shared_dir
+        if not candidate_relative_source_paths:
+            raise ValueError("candidate_relative_source_paths must not be empty")
+        if len(candidate_relative_source_paths) > limits.max_files_per_iteration:
+            raise ValueError("tool source list exceeds shared_dir file limit")
+        prefix = PurePosixPath(TOOL_DRAFTS_RELATIVE_PATH)
+        normalized_paths: list[str] = []
+        for raw_path in candidate_relative_source_paths:
+            path = PurePosixPath(raw_path)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("tool source paths must be relative without '..'")
+            try:
+                relative = path.relative_to(prefix)
+            except ValueError as exc:
+                raise ValueError(
+                    f"tool sources must be under {TOOL_DRAFTS_RELATIVE_PATH}"
+                ) from exc
+            if str(relative) == ".":
+                raise ValueError("select explicit entries below the tool draft directory")
+            normalized_paths.append(path.as_posix())
+        if len(normalized_paths) != len(set(normalized_paths)):
+            raise ValueError("tool source paths must be unique")
+        for left_index, left in enumerate(normalized_paths):
+            left_path = PurePosixPath(left)
+            for right in normalized_paths[left_index + 1 :]:
+                right_path = PurePosixPath(right)
+                if left_path in right_path.parents or right_path in left_path.parents:
+                    raise ValueError("tool source paths must be non-overlapping")
+        if idempotency_key is not None:
+            existing = next(
+                (
+                    item
+                    for item in record.pending_fs_tool_stages
+                    if item.get("rpc_request_id") == idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                expected = {
+                    "name": normalized_name,
+                    "summary": normalized_summary,
+                    "entrypoint": normalized_entrypoint,
+                    "source_paths": normalized_paths,
+                }
+                if any(existing.get(key) != value for key, value in expected.items()):
+                    raise RuntimeError(
+                        "shared tool idempotency key was reused with new content"
+                    )
+                return {
+                    **existing,
+                    "staging_path": f"snapshot://next/{existing['staged_name']}",
+                    "file_count": None,
+                    "size_bytes": None,
+                    "path_count": None,
+                }
+        if len(record.pending_fs_tool_stages) >= limits.max_tools_per_iteration:
+            raise ValueError("pending shared tools exceed max_tools_per_iteration")
+        stage_id = f"stage_{uuid.uuid4().hex}"
+        staged_name = f"tool-{sha256_text(normalized_name)[:12]}-{stage_id[-8:]}"
+        stage = {
+            "stage_id": stage_id,
+            "staged_name": staged_name,
+            "name": normalized_name,
+            "summary": normalized_summary,
+            "entrypoint": normalized_entrypoint,
+            "source_paths": normalized_paths,
+            "staged_at": utc_timestamp(),
+            **(
+                {"rpc_request_id": idempotency_key}
+                if idempotency_key is not None
+                else {}
+            ),
+        }
+        record.pending_fs_tool_stages.append(stage)
+        self._write_candidate_record(run.run_id, record)
+        return {
+            **stage,
+            "staging_path": f"snapshot://next/{staged_name}",
+            "file_count": None,
+            "size_bytes": None,
+            "path_count": None,
+        }
+
     def copy_shared_tool(
-        self, agent_session_id: str, tool_id: str, snapshot_hash: str
+        self,
+        agent_session_id: str,
+        tool_id: str,
+        snapshot_hash: str,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         session = self._load_agent_session_by_id(agent_session_id)
         lock_path = self._candidate_dir(session.run_id, session.candidate_id) / "verifier.lock"
@@ -2229,11 +2337,53 @@ class FileSearchRuntime:
                 ):
                     raise ValueError("pending tool copies exceed shared_dir max_tools_per_iteration")
                 if any(item.tool_id == tool_id for item in record.pending_tool_copies):
+                    existing = next(
+                        item
+                        for item in record.pending_tool_copies
+                        if item.tool_id == tool_id
+                    )
+                    if (
+                        idempotency_key is not None
+                        and existing.rpc_request_id == idempotency_key
+                        and existing.snapshot_hash == snapshot_hash
+                    ):
+                        return {
+                            **existing.model_dump(mode="json"),
+                            "state": "copy_required_at_turn_boundary",
+                            "logical_inbox": (
+                                f"{TOOL_INBOX_RELATIVE_PATH}/{existing.receipt_id}"
+                            ),
+                        }
                     raise ValueError(
                         "tool already copied for the next verifier iteration: "
                         f"{tool_id}"
                     )
                 tool = self._resolve_shared_tool(session.run_id, tool_id, snapshot_hash)
+                if frozen.spec.strategy.worker_host == "pi-thinkthread":
+                    base_ref = self._fs_snapshot_ref(
+                        record.settled_artifact_ref or run.baseline_artifact_ref,
+                        field="tool copy candidate base",
+                    )
+                    receipt = ToolCopyReceipt(
+                        receipt_id=f"copy_{uuid.uuid4().hex[:24]}",
+                        rpc_request_id=idempotency_key,
+                        tool_id=tool.tool_id,
+                        snapshot_hash=tool.snapshot_hash,
+                        source_artifact_ref=tool.source_artifact_ref,
+                        source_commit=tool.source_commit,
+                        agent_session_id=agent_session_id,
+                        candidate_base_artifact_ref=base_ref,
+                        copied_at=utc_timestamp(),
+                    )
+                    record.pending_tool_copies.append(receipt)
+                    self._write_candidate_record(session.run_id, record)
+                    return {
+                        **receipt.model_dump(mode="json"),
+                        "state": "copy_required_at_turn_boundary",
+                        "logical_inbox": (
+                            f"{TOOL_INBOX_RELATIVE_PATH}/{receipt.receipt_id}"
+                        ),
+                    }
                 if record.results_ledger_git_head is None:
                     raise RuntimeError("tool copy requires a Git-backed candidate")
                 receipt_id = f"copy_{uuid.uuid4().hex[:24]}"
@@ -2248,8 +2398,19 @@ class FileSearchRuntime:
                     receipt_id=receipt_id,
                     tool_id=tool.tool_id,
                     snapshot_hash=tool.snapshot_hash,
+                    source_artifact_ref=(
+                        tool.source_artifact_ref
+                        or (
+                            GitCommitArtifactRef(commit=tool.source_commit)
+                            if tool.source_commit is not None
+                            else None
+                        )
+                    ),
                     source_commit=tool.source_commit,
                     agent_session_id=agent_session_id,
+                    candidate_base_artifact_ref=GitCommitArtifactRef(
+                        commit=record.results_ledger_git_head
+                    ),
                     candidate_base_git_head=record.results_ledger_git_head,
                     inbox_path=inbox_path,
                     copied_at=utc_timestamp(),
@@ -2266,11 +2427,51 @@ class FileSearchRuntime:
         agent_session_id: str | None = None,
         hypothesis: str | None = None,
         toolization_decision: ToolizationDecision | dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> ScoreReport:
         if scope not in {"process", "promotion"}:
             raise ValueError("verifier scope must be 'process' or 'promotion'")
         lock_path = self._candidate_dir(run_id, candidate_id) / "verifier.lock"
         with exclusive_file_lock(lock_path):
+            if idempotency_key is not None:
+                record = self._load_candidate_record(run_id, candidate_id)
+                matching = [
+                    item
+                    for item in record.iterations
+                    if item.rpc_request_id == idempotency_key
+                ]
+                if len(matching) > 1:
+                    raise RuntimeError(
+                        "verifier idempotency key is bound to multiple iterations"
+                    )
+                if matching:
+                    if (
+                        matching[0] is not record.iterations[-1]
+                        or record.score_report is None
+                    ):
+                        raise RuntimeError(
+                            "verifier idempotency replay cannot recover its exact report"
+                        )
+                    run = self._load_run(run_id)
+                    frozen = self._load_frozen_spec(run.frozen_spec_id)
+                    if frozen.spec.strategy.worker_host != "pi-thinkthread":
+                        raise RuntimeError(
+                            "verifier idempotency keys are reserved for pi-thinkthread"
+                        )
+                    self._reconcile_pi_thinkthread_iteration_replay(
+                        run_id=run_id,
+                        candidate_id=candidate_id,
+                        iteration=matching[0],
+                        report=record.score_report,
+                    )
+                    if scope == "process" and agent_session_id is not None:
+                        self._kick_evidence_annotator(run_id)
+                    self._close_fs_requests_after_evidence(
+                        run_id,
+                        list(matching[0].verifier_request_ids),
+                        self._agent_posix_client(),
+                    )
+                    return record.score_report
             if scope == "process" and agent_session_id is None:
                 with self._run_transaction(run_id):
                     record = self._load_candidate_record(run_id, candidate_id)
@@ -2286,6 +2487,7 @@ class FileSearchRuntime:
                 agent_session_id=agent_session_id,
                 hypothesis=hypothesis,
                 toolization_decision=toolization_decision,
+                idempotency_key=idempotency_key,
             )
         if scope == "process" and agent_session_id is not None:
             self._kick_evidence_annotator(run_id)
