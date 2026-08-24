@@ -1236,3 +1236,140 @@ def _receive_job_messages(
     job["message_cursor"] = next_cursor
     _write_job(root_dir, str(job["pool_id"]), job)
     return handled
+
+
+def _restore_job_branch(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool_id: str,
+    job: dict[str, Any],
+) -> bool:
+    restore = job.get("restore_required")
+    if not isinstance(restore, dict) or restore.get("state") == "restored":
+        return True
+    branch_id = job.get("fs_branch_id")
+    target_snapshot_id = restore.get("target_snapshot_id")
+    if not isinstance(branch_id, str) or not isinstance(target_snapshot_id, str):
+        raise RuntimeError("restore intent omitted branch or target snapshot")
+    restore["state"] = "restoring"
+    _write_job(root_dir, pool_id, job)
+    branch = sdk.invoke("fs.branch.stat", {"branchId": branch_id})
+    if branch.get("baseSnapshotId") != target_snapshot_id:
+        if not _ensure_branch_mutation_execution_absent(
+            sdk,
+            root_dir,
+            pool_id,
+            job,
+        ):
+            restore["state"] = "needs_recovery"
+            _write_job(root_dir, pool_id, job)
+            return False
+        generation = branch.get("controlGeneration")
+        if not isinstance(generation, int):
+            raise RuntimeError("fs.branch.stat omitted controlGeneration")
+        try:
+            sdk.invoke(
+                "fs.branch.reset",
+                {
+                    "branchId": branch_id,
+                    "toSnapshotId": target_snapshot_id,
+                    "ifGeneration": generation,
+                },
+                timeout_seconds=60.0,
+            )
+        except AgentPosixBridgeError as exc:
+            if not exc.completion_unknown:
+                raise
+            observed = sdk.invoke("fs.branch.stat", {"branchId": branch_id})
+            if observed.get("baseSnapshotId") != target_snapshot_id:
+                restore["state"] = "needs_recovery"
+                restore["error"] = str(exc)
+                _write_job(root_dir, pool_id, job)
+                return False
+    runtime.complete_pi_thinkthread_restore(
+        run_id=str(job["run_id"]),
+        candidate_id=str(job["candidate_id"]),
+        branch_id=branch_id,
+        target_snapshot_id=target_snapshot_id,
+    )
+    restore["state"] = "restored"
+    restore["restored_at"] = utc_timestamp()
+    _write_job(root_dir, pool_id, job)
+    return True
+
+
+def _ensure_branch_mutation_execution_absent(
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool_id: str,
+    job: dict[str, Any],
+) -> bool:
+    """Stop only the current retained runtime before mutating its branch.
+
+    A completed Pi turn can leave the retained Agent process resident with
+    ``agentState=ready`` and ``executionState=running``. ThinkThread correctly
+    rejects branch reset while that process is present. TERM ends the current
+    execution without destroying the Child or its native Session; a later
+    Message wake starts the same Session on the restored branch.
+    """
+
+    child_id = job.get("thinkthread_id")
+    if not isinstance(child_id, str):
+        raise RuntimeError("branch mutation omitted retained ThinkThread Child")
+    active_message_id = job.get("active_message_id")
+    intent = job.get("branch_mutation_execution_stop")
+    if not isinstance(intent, dict) or intent.get("message_id") != active_message_id:
+        intent = {
+            "state": "prepared",
+            "message_id": active_message_id,
+            "prepared_at": utc_timestamp(),
+        }
+        job["branch_mutation_execution_stop"] = intent
+        _write_job(root_dir, pool_id, job)
+
+    observed = sdk.invoke("thinkthread.get", {"id": child_id})
+    if observed.get("executionState") == "absent":
+        intent["state"] = "execution_absent"
+        intent["confirmed_at"] = utc_timestamp()
+        _write_job(root_dir, pool_id, job)
+        return True
+
+    intent["state"] = "term_started"
+    intent["term_started_at"] = utc_timestamp()
+    _write_job(root_dir, pool_id, job)
+    try:
+        sdk.invoke("thinkthread.signal", {"id": child_id, "signal": "TERM"})
+    except AgentPosixBridgeError as exc:
+        # A lost signal response is reconciled by the authoritative wait below;
+        # an explicit rejection remains a recovery condition unless the same
+        # wait proves the execution already disappeared.
+        intent["signal_error"] = {
+            "message": str(exc),
+            "error_code": exc.code,
+            "completion_unknown": exc.completion_unknown,
+        }
+    intent["state"] = "waiting_for_execution_absent"
+    intent["wait_started_at"] = utc_timestamp()
+    _write_job(root_dir, pool_id, job)
+    child = _wait_for_execution_absent(
+        sdk,
+        child_id,
+        BRANCH_MUTATION_STOP_TIMEOUT_SECONDS,
+    )
+    if child is not None:
+        intent["state"] = "execution_absent"
+        intent["confirmed_at"] = utc_timestamp()
+        intent["completion"] = child.get("completion")
+        intent.pop("error", None)
+        _write_job(root_dir, pool_id, job)
+        return True
+
+    intent["state"] = "needs_recovery"
+    intent["error"] = "retained Child execution remained present after TERM/wait"
+    intent["last_observation"] = sdk.invoke(
+        "thinkthread.get", {"id": child_id}
+    )
+    intent["updated_at"] = utc_timestamp()
+    _write_job(root_dir, pool_id, job)
+    return False
