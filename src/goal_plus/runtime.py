@@ -5630,6 +5630,8 @@ class FileSearchRuntime:
             run.budget_used.pop("selection_blocked_reason", None)
             self._write_run(run)
         frozen = self._load_frozen_spec(run.frozen_spec_id)
+        if frozen.spec.strategy.worker_host == "pi-thinkthread":
+            return self._select_pi_thinkthread(run_id, frozen)
         records = self._load_candidate_records(run_id)
         options = self._selection_options(run, records, frozen.spec.metric_direction)
         if not options:
@@ -5701,7 +5703,12 @@ class FileSearchRuntime:
                 final_report = report
                 break
 
-        if selected_record is None or selected_score is None:
+        if (
+            selected_record is None
+            or selected_score is None
+            or selected_iteration is None
+            or selected_git_head is None
+        ):
             self._mark_selection_blocked(
                 run_id,
                 "all eligible candidate revisions failed verification",
@@ -5724,6 +5731,9 @@ class FileSearchRuntime:
             run.best_score = selected_score
             run.selected_score = selected_score
             run.selected_iteration = selected_iteration
+            run.selected_artifact_ref = GitCommitArtifactRef(
+                commit=selected_git_head
+            )
             run.selected_git_head = selected_git_head
             run.selected_artifact_hash = selected_artifact_hash
             run.budget_used.pop("selection_blocked_reason", None)
@@ -5771,6 +5781,90 @@ class FileSearchRuntime:
             "selection_evidence_source": selection_evidence_source,
             "best_candidate_id": run.best_candidate_id,
             "best_score": run.best_score,
+        }
+
+    def _select_pi_thinkthread(
+        self,
+        run_id: str,
+        frozen: FrozenSpec,
+    ) -> dict[str, Any]:
+        run = self._load_run(run_id)
+        options: list[tuple[float, CandidateRecord, IterationRecord]] = []
+        for record in self._load_candidate_records(run_id):
+            iteration = self._best_iteration_record(
+                record,
+                frozen.spec.metric_direction,
+            )
+            if (
+                iteration is None
+                or not self._fs_iteration_eligible(iteration)
+                or iteration.disposition in {"discard", "failure"}
+                or iteration.score is None
+            ):
+                continue
+            options.append((iteration.score, record, iteration))
+        if not options:
+            with self._run_transaction(run_id):
+                blocked = self._load_run(run_id)
+                blocked.state = RunState.SELECTION_BLOCKED
+                blocked.budget_used["selection_blocked_reason"] = (
+                    "no exact FsSnapshot verifier Evidence is eligible for selection"
+                )
+                self._write_run(blocked)
+            raise RuntimeError("no verified FsSnapshot candidates available")
+        maximize = frozen.spec.metric_direction == "maximize"
+        selected_score, selected_record, selected_iteration = sorted(
+            options,
+            key=lambda item: (
+                item[0] if maximize else -item[0],
+                item[1].candidate_id == run.best_candidate_id,
+            ),
+            reverse=True,
+        )[0]
+        selected_ref = self._fs_snapshot_ref(
+            selected_iteration.attempt_ref,
+            field="selected iteration",
+        )
+        if selected_iteration.artifact_hash is None:
+            raise RuntimeError("selected FsSnapshot Evidence omitted artifact hash")
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            self._assert_run_not_invalidated(run, "record selection")
+            run.state = RunState.READY_TO_PROMOTE
+            run.selected_candidate_id = selected_record.candidate_id
+            run.best_candidate_id = selected_record.candidate_id
+            run.best_score = selected_score
+            run.selected_score = selected_score
+            run.selected_iteration = selected_iteration.iteration
+            run.selected_artifact_ref = selected_ref
+            run.selected_git_head = None
+            run.selected_artifact_hash = selected_iteration.artifact_hash
+            run.budget_used.pop("selection_blocked_reason", None)
+            selected_record = self._load_candidate_record(
+                run_id,
+                selected_record.candidate_id,
+            )
+            selected_record.promotion_report = None
+            selected_record.promotion_evidence = None
+            self._write_candidate_record(run_id, selected_record)
+            self._write_best_fs_artifact(
+                run,
+                frozen.spec,
+                selected_record,
+                selected_iteration,
+            )
+            self._write_run(run)
+        return {
+            "selected_candidate_id": selected_record.candidate_id,
+            "selected_score": selected_score,
+            "selected_iteration": selected_iteration.iteration,
+            "selected_artifact_ref": selected_ref.model_dump(mode="json"),
+            "selected_artifact_hash": selected_iteration.artifact_hash,
+            "selection_basis_score": selected_score,
+            "final_verifier_score": selected_score,
+            "selection_evidence_source": "worker_evidence",
+            "best_candidate_id": selected_record.candidate_id,
+            "best_score": selected_score,
         }
 
     def _mark_selection_blocked(self, run_id: str, reason: str) -> None:
