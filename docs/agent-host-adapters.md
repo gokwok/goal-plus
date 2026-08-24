@@ -24,17 +24,17 @@ current `spawn_agent` schema rather than assumed optional metadata.
 
 ## Maintained Capability Matrix
 
-| Capability | Codex | Pi RPC |
-|---|---|---|
-| Launch | async `spawn_agent` | detached local supervisor + foreground Pi child |
-| Wait mode | `wait_agent` any-event wake + `list_agents` | `pi_search_pool_wait_any` |
-| Continuation | same worker via `followup_task` | same native session in a new process |
-| Deadline | per-dispatch parent watchdog | cumulative pool lease + Pi process watchdog |
-| Recovery | native agent registry + `.gp` | persisted `.gp/host-pools/pi/` + `.gp` |
-| Goal gate | `UserPromptSubmit`, `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop` | extension input/tool/turn events |
-| Strategy coverage | initial parallel loops | initial parallel loops |
-| Model discovery | Codex app-server `model/list` | Pi RPC `get_available_models` |
-| Normalized observability | native session JSONL + bound metadata | `pi_metrics` + bound metadata |
+| Capability | Codex | Pi RPC | Pi ThinkThread |
+|---|---|---|---|
+| Launch | async `spawn_agent` | detached local supervisor + foreground Pi child | direct Child through Agent POSIX `thinkthread.spawn` |
+| Wait mode | `wait_agent` any-event wake + `list_agents` | `pi_search_pool_wait_any` | bounded Child/Message wait-any through the same logical pool tools |
+| Continuation | same worker via `followup_task` | same native session in a new process | same retained Child Session via Message wake |
+| Deadline | per-dispatch parent watchdog | cumulative pool lease + Pi process watchdog | cumulative pool lease + INT/TERM Child watchdog |
+| Recovery | native agent registry + `.gp` | persisted `.gp/host-pools/pi/` + `.gp` | durable pool/Message/fs requests + direct-Child observation |
+| Goal gate | `UserPromptSubmit`, `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop` | extension input/tool/turn events | Root extension gate; Child exposes only Message-backed worker tools |
+| Strategy coverage | initial parallel loops | initial parallel loops | initial parallel loops |
+| Model discovery | Codex app-server `model/list` | Pi RPC `get_available_models` | Profile-delegated Agent POSIX catalog |
+| Normalized observability | native session JSONL + bound metadata | `pi_metrics` + bound metadata | Child state/model/fs handle + durable pool/storage facts |
 
 All adapters implement the read-only `collect_observability` contract exposed
 as `search_get_agent_observability`. This is provenance and diagnostics only;
@@ -79,6 +79,10 @@ Codex and Pi both satisfy asynchronous wait-any semantics:
   candidate-ready event main calls `continue` for that same candidate unless a
   global stop condition is true. Pi reloads the same native session in a new
   process.
+- **Pi ThinkThread** persists the same logical pool contract but launches
+  Message-only direct Children from one exact baseline. It wakes the same Child
+  and branch, snapshots/verifies exact turn-boundary state, and resets that
+  branch to the prior best snapshot on discard/failure.
 
 New Pi/Codex specs set `orchestration_mode="parallel_loops"`; one initial round
 creates the durable candidate loops. Neither adapter turns that round into a
@@ -90,6 +94,7 @@ completion barrier. Low score or no improvement never causes replacement.
 |---|---|---|
 | Codex | `worker_budget.max_runtime_seconds` | initial wait, one closeout message, final wait, interrupt |
 | Pi RPC | `worker_budget.max_runtime_seconds` | closeout steer plus hard process watchdog |
+| Pi ThinkThread | `worker_budget.max_runtime_seconds` | retained-Child lease plus INT/TERM watchdog |
 
 `max_turns` is only a prompt hint for Codex and Pi. `max_parallel` uniquely
 sets the initial candidate/live-worker count because later work continues the
@@ -108,9 +113,12 @@ resumes. Each resume receives only the remaining max runtime; infrastructure
 failure and pool/outer closeout terminate the lease.
 
 `strategy.worker_launch` carries optional host launch preferences. Codex maps
-`model`, `reasoning_effort`, and `service_tier` when exposed; Pi maps model and
-thinking level through trusted process configuration. These values do not
-belong to Search state.
+`model`, `reasoning_effort`, and `service_tier` when exposed. Legacy `pi-rpc`
+maps model and thinking level through trusted process configuration.
+`pi-thinkthread` maps only an exact provider/model binding through typed Child
+derivation; reasoning effort and service tier are rejected because they are
+not ThinkThread Child derivation fields. These values do not belong to Search
+state.
 
 ## Resume And Handoff
 
@@ -119,8 +127,10 @@ State-level redispatch is the portable recovery path:
 1. call `search_redispatch_candidate` for an existing candidate;
 2. launch the fresh `agent_session_id` in the same workspace;
 3. the worker reloads `search_get_agent_context`;
-4. candidate-local Git state, verifier iterations, `research_summary`, and the
-   narrow `search_get_global_evidence` view replace dependence on a previous transcript.
+4. candidate-local artifact state, verifier iterations, `research_summary`,
+   and the narrow `search_get_global_evidence` view replace dependence on a
+   previous transcript. Git hosts retain Git state; `pi-thinkthread` retains
+   the same private fs branch and exact settled snapshot.
 
 Same-worker continuation is native on Codex. Pi provides native session
 continuation across process boundaries: each dispatch has a new PID,
@@ -138,13 +148,13 @@ until the main agent confirms them.
 
 The runtime fence is host-neutral; quiescence is adapter-specific:
 
-| Step | Codex | Pi RPC |
-|---|---|---|
-| Fence | `search_invalidate_run` | `search_invalidate_run` |
-| Stop live work | `interrupt_agent` for every live candidate | `pi_search_pool_close(mode="interrupt")` |
-| Prove quiescence | `list_agents`/`wait_agent` until all terminal | snapshot/wait until `active_count=0` |
-| Rebuild | repair/freeze only after quiescence | repair/freeze only after quiescence |
-| Successor | `search_create(..., source_run_id=old)` | same |
+| Step | Codex | Pi RPC | Pi ThinkThread |
+|---|---|---|---|
+| Fence | `search_invalidate_run` | `search_invalidate_run` | `search_invalidate_run` |
+| Stop live work | `interrupt_agent` for every live candidate | `pi_search_pool_close(mode="interrupt")` | same logical close; INT/TERM, branch remove, Child destroy |
+| Prove quiescence | `list_agents`/`wait_agent` until all terminal | snapshot/wait until `active_count=0` | pool cleanup observation + no direct Child/branch |
+| Rebuild | repair/freeze only after quiescence | repair/freeze only after quiescence | same; take a new Root baseline |
+| Successor | `search_create(..., source_run_id=old)` | same | same |
 
 Adapters must not attempt to refill an invalidated run. The runtime also rejects
 Pi pool open/submit and rejects a verifier result that finishes after the fence.

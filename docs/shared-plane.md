@@ -5,8 +5,9 @@ Mode；具有明确可度量目标的优化任务进入 Search Mode。Search Mod
 合同，再让多个隔离、长期运行的 candidate 并行探索。
 
 Search Mode 的核心是持久化的共享平面。共享平面不共享 agent 的私有推理，也不共享
-可写工作区。它只共享冻结合同、精确 Git revision、verifier 支持的 Evidence、异步
-生成的客观 View 与可选开放式补充评价，以及选择和提升结果所需的持久化状态。
+可写工作区。它只共享冻结合同、精确不可变 ArtifactRef（Git commit 或 ThinkThread fs
+snapshot）、verifier 支持的 Evidence、异步生成的客观 View 与可选开放式补充评价，
+以及选择和提升结果所需的持久化状态。
 
 ## 总体架构
 
@@ -17,7 +18,7 @@ main agent
   v
 +------------------------- 共享运行时平面 -------------------------+
 | Goal 记录与冻结 SearchSpec                                      |
-| candidate 工作区与 Git revision                                 |
+| candidate 工作区与精确 ArtifactRef                              |
 | verifier-backed Global Evidence 与异步 View                     |
 | candidate-local best、全局 best、报告与 promotion               |
 +------------------------------------------------------------------+
@@ -34,7 +35,7 @@ main agent
 
 | 所有者 | 职责 |
 |---|---|
-| Search runtime | 冻结合同、物化工作区、提交 Git 和 verifier Evidence、回滚、选择、报告与 promotion |
+| Search runtime | 冻结合同、物化工作区、捕获精确 artifact 和 verifier Evidence、回滚、选择、报告与 promotion |
 | candidate worker | 选择自己的技术方向、修改自己的工作区、调用 verifier、提交 handoff |
 | main agent | triage、spec discovery、初始 candidate 分配、全局停止、最终收尾、确认 verifier 失效 |
 | Codex 或 Pi 宿主 | 实际 worker 启动、等待、续跑、deadline、interrupt 和原生 transcript |
@@ -107,7 +108,7 @@ worker，再冻结修正后的 spec，创建 successor run。旧分数不能跨�
 3. 每个 candidate 获得独立工作区并开始自主循环。
 4. 宿主以 wait-any 方式返回完成事件；较慢 lane 不阻塞其他 lane 发布 Evidence。
 5. 只要全局停止条件未满足，宿主续跑同一个 candidate、原生 session 和工作区。
-6. 收尾时先让所有 live worker 静止，再选择精确 commit，执行 promotion gate 并生成报告。
+6. 收尾时先让所有 live worker 静止，再选择精确 ArtifactRef，执行 promotion gate 并生成报告。
 
 `budget.max_parallel` 是 spec 的初始 candidate 和 live-worker 数量。普通
 `parallel_loops` run 只做一次初始分配，不按分数创建替代 candidate，也没有后续
@@ -147,7 +148,8 @@ publication settlement 始终是权威。
 
 main agent 不向 worker 提供后续技术方向。正常路径优先续跑同一个原生 session；
 redispatch 只用于恢复，并继续使用同一个 candidate 工作区、Git 历史、verifier 历史
-和有界 handoff。
+和有界 handoff。Git host 使用 candidate Git 历史；`pi-thinkthread` 使用同一 retained
+Child Session、私有 fs branch 和结算后的精确 snapshot。
 
 ## Global Evidence
 
@@ -243,11 +245,12 @@ View 只用一句中文客观描述实际做了什么，不评价好坏、不推
 观察作为下一轮假设来源，但必须独立核对；评价不产生总分或最终推荐，不能改变硬 score、
 PASS/FAIL、candidate-local 基线、run-wide 排名或 promotion gate。
 
-annotator 收到的累计 diff 使用 Git 函数级上下文和至少 10 行普通上下文，并继续受字节
-上限约束。上下文中未出现某个定义，不代表该定义不存在；这类判断必须降低置信度并写入
+annotator 收到的累计 diff 只通过 ArtifactReader 物化并受字节上限约束：Git artifact
+保留函数级上下文和至少 10 行普通上下文，fs snapshot 使用有界内容投影。上下文中未出现
+某个定义，不代表该定义不存在；这类判断必须降低置信度并写入
 `limitations`。每次 worker 调用 `search_get_global_evidence`，runtime 都会在对应
 `agent_sessions/*.json` 的 `global_evidence_reads` 中记录读取时间、当时 Evidence 数量、
-已完成 View 的 candidate/iteration/commit 引用以及其中是否含 supplemental evaluation。
+已完成 View 的 candidate/iteration/ArtifactRef 引用以及其中是否含 supplemental evaluation。
 该读取记录只用于审计 View 是否在后续 verifier 之前可见，不参与候选结算或最终验收。
 
 `view=null` 只表示 annotation 尚未发布，Evidence 本身已经有效。candidate 可以先按
@@ -261,24 +264,28 @@ invalidated、aborted 或 failed run 的发布 fence 继续拒绝修改。需要
 完整 View 的 controller，可以显式同步 drain 已登记的有界重试，而不改变 SearchTools 的
 选择或 promotion 语义。
 
-## Git 与 Candidate-Local Best
+## ArtifactRef 与 Candidate-Local Best
 
-Evidence 中的 commit 表示 verifier 实际读取的完整 Git tree，不是相对于初始源码的
-patch。Runtime 分别记录：
+Evidence 通过 `ArtifactRef` 表示 verifier 实际读取的完整不可变代码树，而不是相对于
+初始源码的 patch。Codex 与 legacy `pi-rpc` 使用 `git_commit`；`pi-thinkthread` 使用
+`fs_snapshot`，且不会伪造 Git commit。Git 路径继续兼容记录：
 
 - `attempt_base_git_head`：尝试前的 settled HEAD；
 - `git_head`：verifier 实际验证的 attempt commit；
 - `attempt_changed_files`：用于 annotation 的 `base..attempt` 净变化；
 - `changed_files`：相对于原始 source 的最终 artifact 变化，用于策略检查和 promotion。
 
-Runtime 会在验证前提交所有 candidate-controlled 修改，并要求 artifact worktree
+Git 路径会在验证前提交所有 candidate-controlled 修改，并要求 artifact worktree
 干净。candidate 可以包含多个手工 commit；annotation 使用完整
-`settled-base..attempt` 范围，而不是只查看最后一个 commit。
+`settled-base..attempt` 范围，而不是只查看最后一个 commit。ThinkThread 路径在 turn
+边界捕获 Child branch snapshot，并在该 exact snapshot 上执行 verifier。两条路径的
+Evidence、Global Evidence、peer comparison 和 annotator 都通过 ArtifactReader 读取
+有界 diff 与文件上下文。
 
 每次 process-verifier 尝试都会永久保留。严格改善和同分分别以 `keep`、`retain` 更新
 candidate-local 最新最佳。只有 `discard` 或 `failure` 时，Runtime 才把代码恢复到此前
-最佳版本，再追加不可变的
-`results.tsv` ledger：
+最佳版本。Git 路径再追加不可变的 `results.tsv` ledger；ThinkThread 路径把 disposition、
+score、verifier 结果、changed files 和 snapshot ArtifactRef 持久化到 iteration ledger：
 
 ```text
 keep:     settled -> attempt -> ledger
@@ -286,7 +293,7 @@ retain:   settled -> equal-score attempt -> ledger
 discard:  settled -> attempt -> restore-best -> ledger
 ```
 
-attempt、恢复和 ledger commit 都保持可达。因此下一轮始终从 candidate-local best
+attempt、恢复和 ledger artifact 都保持可达。因此下一轮始终从 candidate-local best
 规划，而 Global Evidence 仍保留好、差和失败的全部尝试。一个 candidate 的回滚不会
 改变 peer 工作区，也不会修改 peer 的判断。
 
@@ -298,20 +305,22 @@ git show <commit>:<allowed-file>
 git diff HEAD <commit> -- <allowed-file>
 ```
 
-candidate 不应 checkout、reset 或修改 peer revision。最终 promotion artifact 虽然是
-相对于 source 生成的 patch，但这不会改变 Evidence commit 代表完整代码树的语义。
+candidate 不应 checkout、reset 或修改 peer revision。ThinkThread Child 不访问 Parent
+或 sibling branch；peer comparison 由 Root 通过 ArtifactReader 物化。最终 promotion
+artifact 虽然相对于 source 生成 patch 或 strict publication，但不会改变 Evidence
+ArtifactRef 代表完整代码树的语义。
 
 ## 选择、Promotion 与失效
 
 run-wide best 从有效 iteration record 的硬 score 中计算，与各 candidate-local best 分开。
 `search_select` 不读取补充评价或 peer 比较来改变排名；硬分并列按原有稳定顺序选择。它将
-结果绑定到一个精确、通过验证的 worker Evidence commit。只有旧状态
+结果绑定到一个精确、通过验证的 worker Evidence ArtifactRef。只有旧状态
 或当前产物没有对应 durable Evidence 时，parent 才补做 process verifier。
 
-promotion 是独立的验收 gate。Runtime 会检出选中的不可变 revision，在
-`GOAL_PLUS_VERIFIER_PHASE=promotion` 下重跑配置的 promotion verifier，并把结果绑定
-到 Git head 和 artifact hash。只有 promotion 成功，才生成可被 Git 应用的 patch；
-source workspace 不会被静默修改。
+promotion 是独立的验收 gate。Runtime 会在选中的不可变 artifact 上，以
+`GOAL_PLUS_VERIFIER_PHASE=promotion` 重跑配置的 promotion verifier，并把结果绑定到
+精确 ArtifactRef。Git 路径只有 promotion 成功才生成可应用的 patch；ThinkThread 路径
+则用 initial baseline 和 selected snapshot 执行 strict publication，冲突时不覆盖 Root。
 
 worker 报告的 verifier concern 只是建议。main agent 确认缺陷后，Runtime 先原子
 invalidate 并 fence 当前 run，宿主再停止所有 worker。修复后的合同必须进入 successor
@@ -331,22 +340,24 @@ run。可以继承有界研究上下文，但不能继承旧分数或把旧 Evid
       candidate.json
       evidence-annotations/iteration-<n>.json
     agent_sessions/<agent_session_id>.json
-    workspace/<candidate_id>/
+    workspace/<candidate_id>/                 # Git-backed hosts only
     report.md
     report.html
-    promotion/<candidate_id>.patch
+    promotion/<candidate_id>.patch            # Git-backed hosts
+    promotion/<candidate_id>.publication.json # pi-thinkthread
   host-pools/pi/
 ```
 
 `candidate.json` 中的 iteration record 是 Evidence 的事实来源。Annotation task 保存
 可选 View 及其执行状态。Global Evidence 在读取时即时投影，不是第二份可写共享账本。
-`best.json` 是当前 run 最优 verifier commit 的权威原子指针；严格改善或同分时更新，
-退化和失败不会覆盖它。同分 candidate 按最后完成结算的有效 commit 决定。
+`best.json` 是当前 run 最优 verifier ArtifactRef 的权威原子指针；严格改善或同分时更新，
+退化和失败不会覆盖它。同分 candidate 按最后完成结算的有效 artifact 决定。
 
 ## 核心不变量
 
 - 并行工作开始前，先冻结 verifier 与编辑策略。
-- 隔离可写 candidate 工作区，只共享持久化事实和 Git object。
+- 隔离可写 candidate 工作区，只共享持久化事实和不可变 artifact；Git object 只属于
+  Codex/legacy `pi-rpc` 路径。
 - verifier-backed 严格改善或同分最新版本才能成为 candidate-local best。
 - 回滚、选择和 promotion 后，所有精确 attempt 仍可审计。
 - 客观 View 和开放式补充评价都可以延迟，但不能阻塞优化或改变最终硬验收。

@@ -249,6 +249,7 @@ server:
 | `pi_search_pool_snapshot` | inspect one pool or rediscover pools by `run_id` |
 | `pi_search_pool_continue` | resume the same candidate and native Pi session in a new process |
 | `pi_search_pool_close` | drain or terminate live pool jobs |
+| `search_recover_pi_thinkthread` | reconcile caller-owned durable Root/branch snapshot requests after a Goal Plus process crash |
 
 Normal Pi Search uses only these fixed-lane pool tools. The pool does not expose
 a submit/refill API and does not plan candidates.
@@ -274,9 +275,14 @@ goal-plus-pi-tool goal_plus_monitor_snapshot \
 | `ranking_signals` | metric-producing commands |
 | `promotion_verifiers` | checks required before promotion |
 | `budget.max_parallel` | single initial candidate/live-worker count |
-| `strategy.worker_host` | maintained execution host: `pi-rpc` or `codex` |
+| `strategy.worker_host` | maintained execution host: `pi-rpc`, `pi-thinkthread`, or `codex` |
 | `strategy.worker_budget` | host-enforced upper bound and optional minimum lease |
 | `workspace.backend` | `git_worktree` (default) or `copy` |
+
+`pi-thinkthread` is a host selection, not a workspace backend. Its SearchSpec
+must omit `workspace`; Root and private Child filesystem state is represented
+by immutable `fs_snapshot` ArtifactRefs. Codex and legacy `pi-rpc` retain the
+existing `copy`/`git_worktree` behavior.
 
 Every ranking command must exit successfully and print a final JSON object with
 a finite numeric value under `metric_name`. Temporary verifier outputs belong
