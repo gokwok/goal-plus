@@ -486,3 +486,160 @@ def _bind_spawn(
         initial_dispatch["state"] = "sent"
         initial_dispatch["message_id"] = result.get("initialMessageId")
         initial_dispatch["sent_at"] = job["started_at"]
+
+
+def open_pool(
+    *,
+    root_dir: Path | str,
+    run_id: str,
+    candidate_ids: list[str] | None = None,
+    worker_budgets: dict[str, dict[str, Any]] | None = None,
+    final_verify: bool = True,
+    max_parallel: int | None = None,
+    client: AgentPosixSdkClient | None = None,
+) -> dict[str, Any]:
+    runtime = FileSearchRuntime(root_dir)
+    initial_ids = list(candidate_ids or [])
+    run, frozen, selected_parallel, baseline = _validate_run(
+        runtime,
+        run_id,
+        initial_ids,
+        max_parallel,
+    )
+    unknown_budget_ids = sorted(set(worker_budgets or {}) - set(initial_ids))
+    if unknown_budget_ids:
+        raise ValueError(
+            "worker_budgets contains unknown candidate ids: "
+            + ", ".join(unknown_budget_ids)
+        )
+    sdk = client or AgentPosixSdkClient()
+    root_view = _assert_root(sdk)
+    pool_id = f"pool_{uuid.uuid4().hex[:12]}"
+    now = utc_timestamp()
+    pool = {
+        "schema_version": POOL_SCHEMA_VERSION,
+        "pool_id": pool_id,
+        "host": "pi-thinkthread",
+        "run_id": run_id,
+        "root_thinkthread_id": root_view.get("thinkthreadId"),
+        "baseline_snapshot_id": baseline,
+        "max_parallel": selected_parallel,
+        "state": "open",
+        "created_at": now,
+        "updated_at": now,
+        "jobs": [],
+    }
+    with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+        _write_pool(root_dir, pool)
+
+    for candidate_id in initial_ids:
+        session = _selected_session(runtime, run_id, candidate_id)
+        budget = _budget_from_launch(
+            session.launch,
+            (worker_budgets or {}).get(candidate_id),
+        )
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        registration_nonce = str(uuid.uuid4())
+        dispatch_nonce = str(uuid.uuid4())
+        lease_started_unix = time.time()
+        job = {
+            "job_id": job_id,
+            "pool_id": pool_id,
+            "run_id": run_id,
+            "candidate_id": candidate_id,
+            "agent_session_id": session.agent_session_id,
+            "status": "starting",
+            "dispatch_index": 1,
+            "registration_nonce": registration_nonce,
+            "initial_dispatch_nonce": dispatch_nonce,
+            "dispatch_nonce": dispatch_nonce,
+            "dispatch_records": [
+                {
+                    "dispatch_nonce": dispatch_nonce,
+                    "stage": "initial_spawn",
+                    "state": "prepared",
+                    "created_at": utc_timestamp(),
+                }
+            ],
+            "thinkthread_id": None,
+            "fs_branch_id": None,
+            "message_cursor": None,
+            "settled_requests": {},
+            "verifier_runs": 0,
+            "lease_start_verifier_runs": 0,
+            "lease_started_unix": lease_started_unix,
+            "worker_budget": budget,
+            "final_verify": bool(final_verify),
+            "created_at": utc_timestamp(),
+            "updated_at": utc_timestamp(),
+            "started_at": None,
+            "finished_at": None,
+            "delivered_at": None,
+            "error": None,
+        }
+        with exclusive_file_lock(_lock_path(root_dir, pool_id)):
+            _write_job(root_dir, pool_id, job)
+            pool = _load_pool(root_dir, pool_id)
+            pool["jobs"].append(job_id)
+            _write_pool(root_dir, pool)
+        params = _spawn_params(
+            session.launch,
+            baseline,
+            registration_nonce,
+            dispatch_nonce,
+        )
+        job["spawn_intent"] = {
+            "state": "platform_mutation_started",
+            "params_sha256": hashlib.sha256(
+                json.dumps(params, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "observed_children_before": [
+                child.get("thinkthreadId")
+                for child in sdk.invoke("thinkthread.list").get("children", [])
+                if isinstance(child, dict)
+            ],
+        }
+        _write_job(root_dir, pool_id, job)
+        try:
+            result = sdk.invoke("thinkthread.spawn", params, timeout_seconds=120)
+            _bind_spawn(runtime, run_id, candidate_id, session, result, job)
+            job["spawn_intent"]["state"] = "bound"
+        except AgentPosixBridgeError as exc:
+            job["status"] = "needs_recovery" if exc.completion_unknown else "failed"
+            job["error"] = {
+                "stage": "spawn",
+                "message": str(exc),
+                "error_code": exc.code,
+                "completion_unknown": exc.completion_unknown,
+            }
+            job["spawn_intent"]["state"] = (
+                "outcome_unknown" if exc.completion_unknown else "failed"
+            )
+        except Exception as exc:
+            job["status"] = "failed"
+            job["error"] = {
+                "stage": "spawn_binding",
+                "message": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        _write_job(root_dir, pool_id, job)
+    return snapshot_pool(root_dir=root_dir, pool_id=pool_id)
+
+
+def _registration_from_message(
+    message: dict[str, Any],
+    registration_nonce: str,
+) -> bool:
+    text = message.get("text")
+    if not isinstance(text, str) or message.get("truncated") is True:
+        return False
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("protocol") == PROTOCOL
+        and payload.get("type") == "registration"
+        and payload.get("registration_nonce") == registration_nonce
+    )
