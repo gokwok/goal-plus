@@ -354,3 +354,163 @@ class FsSnapshotArtifactReader:
         return (metadata + "\n").encode("utf-8")
 
     def _entry_descriptor(
+        self,
+        snapshot_id: str,
+        path: str,
+        *,
+        absent: bool,
+    ) -> dict[str, Any] | None:
+        if absent:
+            return None
+        entry = self.client.invoke(
+            "fs.snapshot.stat",
+            {"snapshotId": snapshot_id, "path": path},
+        )
+        return {
+            "kind": entry.get("kind"),
+            "len": entry.get("len"),
+            "mode": entry.get("mode"),
+        }
+
+    def diff(
+        self,
+        base: ArtifactRef,
+        target: ArtifactRef,
+        *,
+        paths: list[str] | None = None,
+        max_bytes: int = 1024 * 1024,
+    ) -> str:
+        if paths == []:
+            return ""
+        base_id = _snapshot_ref(base)
+        target_id = _snapshot_ref(target)
+        changes = self._changes_by_path(base, target)
+        selected = sorted(changes) if paths is None else paths
+        pieces: list[str] = []
+        used = 0
+        for path in selected:
+            change = changes.get(path)
+            if change is None:
+                raise ValueError(f"path is not changed between artifacts: {path}")
+            kind = change.get("kind")
+            before = self._project_entry(
+                base_id,
+                path,
+                absent=kind == "added",
+                max_bytes=max_bytes,
+            ).decode("utf-8", errors="replace")
+            after = self._project_entry(
+                target_id,
+                path,
+                absent=kind == "deleted",
+                max_bytes=max_bytes,
+            ).decode("utf-8", errors="replace")
+            text = "".join(
+                difflib.unified_diff(
+                    before.splitlines(keepends=True),
+                    after.splitlines(keepends=True),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                )
+            )
+            if not text:
+                marker = {
+                    "path": path,
+                    "change_kind": kind,
+                    "before": self._entry_descriptor(
+                        base_id,
+                        path,
+                        absent=kind == "added",
+                    ),
+                    "after": self._entry_descriptor(
+                        target_id,
+                        path,
+                        absent=kind == "deleted",
+                    ),
+                    "detail": "change is outside the bounded content projection",
+                }
+                text = (
+                    f"--- a/{path}\n+++ b/{path}\n"
+                    "@@ bounded artifact change @@\n"
+                    + json.dumps(
+                        marker,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
+            encoded = text.encode("utf-8", errors="replace")
+            remaining = max_bytes - used
+            if len(encoded) > remaining:
+                pieces.append(
+                    encoded[: max(0, remaining)].decode("utf-8", errors="replace")
+                )
+                pieces.append("\n[diff truncated]\n")
+                break
+            pieces.append(text)
+            used += len(encoded)
+        return "".join(pieces)
+
+    def read_file(
+        self,
+        artifact: ArtifactRef,
+        path: str,
+        *,
+        max_bytes: int = 1024 * 1024,
+    ) -> bytes:
+        return self.client.snapshot_read_file(
+            _snapshot_ref(artifact),
+            path,
+            max_bytes=max_bytes,
+        )
+
+    def canonical_digest(self, base: ArtifactRef, target: ArtifactRef) -> str:
+        target_id = _snapshot_ref(target)
+        manifest: list[dict[str, Any]] = []
+        for path, change in sorted(self._changes_by_path(base, target).items()):
+            if not candidate_artifact_path(path):
+                continue
+            if change.get("kind") == "deleted":
+                manifest.append({"path": path, "kind": "deleted"})
+                continue
+            entry = self.client.invoke(
+                "fs.snapshot.stat",
+                {"snapshotId": target_id, "path": path},
+            )
+            kind = entry.get("kind")
+            item: dict[str, Any] = {
+                "path": path,
+                "kind": kind,
+                "mode": entry.get("mode"),
+                "len": entry.get("len"),
+            }
+            if kind == "file":
+                length = entry.get("len")
+                if not isinstance(length, int) or length < 0:
+                    raise AgentPosixBridgeError(
+                        "fs.snapshot.stat omitted file len"
+                    )
+                if length <= 64 * 1024 * 1024:
+                    data = self.client.snapshot_read_file(
+                        target_id,
+                        path,
+                        max_bytes=64 * 1024 * 1024,
+                    )
+                    item["sha256"] = hashlib.sha256(data).hexdigest()
+                else:
+                    item["sha256"] = self._file_sha256(
+                        target_id,
+                        path,
+                        expected_length=length,
+                    )
+            elif kind == "symlink":
+                item["symlink_target"] = fs_path_text(entry.get("symlinkTarget"))
+            manifest.append(item)
+        encoded = json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
