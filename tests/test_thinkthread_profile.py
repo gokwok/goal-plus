@@ -44,7 +44,7 @@ def test_pi_goal_plus_profile_is_workspace_generic_and_isolated() -> None:
     assert profile["agent"]["extension"]["loader"] == {
         "kind": "process",
         "command": ["thinkthread-extension-pi"],
-        "protocolVersion": 4,
+        "protocolVersion": 5,
     }
 
     environment = profile["environment"]

@@ -22,7 +22,7 @@ executableSearchPaths = [
 ]
 # The managed Pi installation keeps both the Node interpreter and packages
 # below this ancestor.  Reading only node_modules leaves the shebang's `node`
-# executable outside Sandlock and the Agent exits 127 before TUI readiness.
+# executable outside protected execution and the Agent exits 127 before TUI readiness.
 executableReadAncestor = "pi-node"
 args = [
     "--extension", "${HOME}/.local/share/goal-plus/pi/goal-plus.ts",
@@ -39,7 +39,7 @@ name = "pi"
 [agent.extension.loader]
 kind = "process"
 command = ["thinkthread-extension-pi"]
-protocolVersion = 4
+protocolVersion = 5
 
 [environment]
 fs = "."
