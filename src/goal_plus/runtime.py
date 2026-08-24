@@ -3153,6 +3153,118 @@ class FileSearchRuntime:
                 f"ThinkThreadRequestNeedsRecovery: {request_id} is {state!r}"
             )
 
+    def _invoke_durable_fs_operation(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        run_id: str,
+        request_id: str,
+        method: str,
+        params: dict[str, Any],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds + 30.0
+        try:
+            result = client.invoke(
+                method,
+                params,
+                timeout_seconds=timeout_seconds + 30.0,
+            )
+        except AgentPosixBridgeError as exc:
+            if not exc.completion_unknown and exc.code != "RequestInProgress":
+                try:
+                    recovered = self._recover_fs_request_result(
+                        client=client,
+                        run_id=run_id,
+                        request_id=request_id,
+                        operation=method,
+                        deadline=deadline,
+                    )
+                except AgentPosixBridgeError:
+                    raise
+                if recovered is None:
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="failed",
+                        error={
+                            "message": str(exc),
+                            "code": exc.code,
+                            "delivery": exc.delivery,
+                        },
+                    )
+                    raise
+                return recovered
+            recovered = self._recover_fs_request_result(
+                client=client,
+                run_id=run_id,
+                request_id=request_id,
+                operation=method,
+                deadline=deadline,
+            )
+            if recovered is not None:
+                return recovered
+            # Inspection proved that admission did not persist the operation.
+            # Reusing the same RequestId preserves idempotency.
+            try:
+                result = client.invoke(
+                    method,
+                    params,
+                    timeout_seconds=timeout_seconds + 30.0,
+                )
+            except AgentPosixBridgeError as retry_exc:
+                recovered = self._recover_fs_request_result(
+                    client=client,
+                    run_id=run_id,
+                    request_id=request_id,
+                    operation=method,
+                    deadline=deadline,
+                )
+                if recovered is None:
+                    if (
+                        retry_exc.completion_unknown
+                        or retry_exc.code == "RequestInProgress"
+                    ):
+                        self._update_fs_request(
+                            run_id,
+                            request_id,
+                            state="needs_recovery",
+                            error={
+                                "message": str(retry_exc),
+                                "code": retry_exc.code,
+                                "delivery": retry_exc.delivery,
+                            },
+                        )
+                        self._mark_fs_recovery(
+                            run_id,
+                            reason=(
+                                f"{method} request {request_id} remained "
+                                "unobservable after idempotent replay"
+                            ),
+                        )
+                        raise RuntimeError(
+                            f"ThinkThreadRequestNeedsRecovery: {request_id}"
+                        ) from retry_exc
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="failed",
+                        error={
+                            "message": str(retry_exc),
+                            "code": retry_exc.code,
+                            "delivery": retry_exc.delivery,
+                        },
+                    )
+                    raise
+                return recovered
+        self._update_fs_request(
+            run_id,
+            request_id,
+            state="succeeded",
+            result=result,
+        )
+        return result
+
     def _settle_process_verifier(
         self,
         *,
