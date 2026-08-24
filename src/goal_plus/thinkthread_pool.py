@@ -1776,3 +1776,161 @@ def _send_retained_wake(
     job["status"] = "running"
     job["started_at"] = job.get("started_at") or utc_timestamp()
     _write_job(root_dir, pool_id, job)
+
+
+def _recover_wake_binding(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    job: dict[str, Any],
+) -> bool:
+    intent = job.get("wake_intent")
+    if (
+        job.get("status") != "needs_recovery"
+        or not isinstance(intent, dict)
+        or intent.get("state") != "outcome_unknown"
+        or not isinstance(job.get("thinkthread_id"), str)
+    ):
+        return False
+    _receive_job_messages(runtime, sdk, root_dir, job)
+    if intent.get("state") == "acknowledged":
+        job["status"] = "running"
+        job["error"] = None
+        if intent.get("stage") == "turn_boundary_wake":
+            _complete_turn_boundary_wake(job)
+            job["boundary_wake_count"] = int(
+                job.get("boundary_wake_count", 0)
+            ) + 1
+        _write_job(root_dir, str(job["pool_id"]), job)
+        return True
+    child = sdk.invoke("thinkthread.get", {"id": job["thinkthread_id"]})
+    intent["last_observed_child"] = {
+        "agentState": child.get("agentState"),
+        "executionState": child.get("executionState"),
+        "pendingWake": child.get("pendingWake"),
+        "lastWakeOutcome": child.get("lastWakeOutcome"),
+    }
+    intent["last_recovery_at"] = utc_timestamp()
+    _write_job(root_dir, str(job["pool_id"]), job)
+    return False
+
+
+def _normalize_interrupted_platform_mutation(job: dict[str, Any]) -> bool:
+    """Turn a controller crash window into an explicit recovery state.
+
+    The intent is persisted before spawn/wake. If the controller disappears
+    before persisting the call result, the surviving ``platform_mutation_started``
+    record is authoritative outcome-unknown evidence and must never be retried.
+    """
+
+    spawn = job.get("spawn_intent")
+    if (
+        job.get("status") == "starting"
+        and isinstance(spawn, dict)
+        and spawn.get("state") == "platform_mutation_started"
+    ):
+        spawn["state"] = "outcome_unknown"
+        spawn["recovery_started_at"] = utc_timestamp()
+        job["status"] = "needs_recovery"
+        job["error"] = {
+            "stage": "spawn",
+            "message": "controller exited after spawn admission began",
+            "completion_unknown": True,
+        }
+        return True
+
+    wake = job.get("wake_intent")
+    if (
+        isinstance(wake, dict)
+        and wake.get("state") == "platform_mutation_started"
+    ):
+        wake["state"] = "outcome_unknown"
+        wake["recovery_started_at"] = utc_timestamp()
+        matching = next(
+            (
+                item
+                for item in job.get("dispatch_records", [])
+                if isinstance(item, dict)
+                and item.get("dispatch_nonce") == wake.get("dispatch_nonce")
+            ),
+            None,
+        )
+        if isinstance(matching, dict):
+            matching["state"] = "outcome_unknown"
+        job["status"] = "needs_recovery"
+        job["error"] = {
+            "stage": str(wake.get("stage") or "wake"),
+            "message": "controller exited after retained wake admission began",
+            "completion_unknown": True,
+        }
+        return True
+    return False
+
+
+def _terminal_turn_outcome(
+    job: dict[str, Any],
+    child: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the terminal outcome for this job's exact retained wake.
+
+    A retained Agent runtime may stay alive after a turn, so
+    ``executionState=running`` does not mean the Agent is still processing the
+    wake.  The v2 contract makes ``agentState`` and the message-bound
+    ``lastWakeOutcome`` authoritative for that distinction.  Keep the absent
+    execution fallback for older persisted/mocked Children that predate the
+    wake projection.
+    """
+
+    agent_state = child.get("agentState")
+    if agent_state not in {"ready", "failed"} or child.get("pendingWake") is True:
+        return None
+    active_message_id = job.get("active_message_id")
+    wake = child.get("lastWakeOutcome")
+    if (
+        isinstance(active_message_id, str)
+        and isinstance(wake, dict)
+        and wake.get("messageId") == active_message_id
+        and wake.get("outcome")
+        in {"completed", "interrupted", "failed", "cancelled"}
+    ):
+        return dict(wake)
+    if child.get("executionState") == "absent":
+        return {
+            "messageId": active_message_id,
+            "outcome": "completed" if agent_state == "ready" else "failed",
+            "legacyExecutionAbsent": True,
+        }
+    return None
+
+
+def _recoverable_restore_pending(job: dict[str, Any]) -> bool:
+    restore = job.get("restore_required")
+    copies = job.get("copy_requirements")
+    restore_pending = (
+        isinstance(restore, dict) and restore.get("state") != "restored"
+    )
+    copy_pending = isinstance(copies, list) and any(
+        isinstance(item, dict) and item.get("state") != "applied"
+        for item in copies
+    )
+    error = job.get("error")
+    # Both branch capture and snapshot patch carry caller-owned durable
+    # RequestIds. A later wait can therefore resume the same shared-copy or
+    # restore intent without duplicating its platform mutation.
+    return (
+        (restore_pending or copy_pending)
+        and isinstance(error, dict)
+        and error.get("stage") == "restore"
+    )
+
+
+def _recoverable_final_verifier_stop(job: dict[str, Any]) -> bool:
+    error = job.get("error")
+    boundary = job.get("final_verifier_boundary")
+    return (
+        isinstance(error, dict)
+        and error.get("stage") == "final_verifier"
+        and isinstance(boundary, dict)
+        and boundary.get("state")
+        in {"prepared", "stop_needs_recovery", "platform_mutation_started"}
+    )
