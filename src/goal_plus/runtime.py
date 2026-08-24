@@ -6098,6 +6098,301 @@ class FileSearchRuntime:
                 prior.update(payload)
             self._write_run(run)
 
+    def cleanup_pi_thinkthread_snapshots(self, run_id: str) -> dict[str, Any]:
+        """Durably reclaim every immutable fs snapshot owned by a terminal run.
+
+        Pool/branch cleanup must happen first because fs v1 rejects deletion of
+        a snapshot still pinned by a live or retired private branch. Every
+        mutation reuses one persisted RequestId and its request record is closed
+        only after the matching Goal Plus cleanup fact is durable.
+        """
+
+        run = self._load_run(run_id)
+        frozen = self._load_frozen_spec(run.frozen_spec_id)
+        if frozen.spec.strategy.worker_host != "pi-thinkthread":
+            return {"state": "not_applicable", "removed": [], "pending": []}
+
+        cleanup_recovery = bool(
+            run.budget_used.get("fs_cleanup_recovery_active")
+        )
+        terminal_states = {
+            RunState.PROMOTED,
+            RunState.FAILED,
+            RunState.ABORTED,
+            RunState.SELECTION_BLOCKED,
+        }
+        if run.state not in terminal_states and not (
+            run.state == RunState.NEEDS_RECOVERY and cleanup_recovery
+        ):
+            pending = self._owned_pi_thinkthread_snapshots(run_id)
+            return {
+                "state": "deferred_run_active",
+                "run_state": str(run.state),
+                "removed": [],
+                "pending": pending,
+            }
+        if run.publication is not None and run.publication.state != "committed":
+            pending = self._owned_pi_thinkthread_snapshots(run_id)
+            return {
+                "state": "deferred_publication_recovery",
+                "publication_state": run.publication.state,
+                "removed": [],
+                "pending": pending,
+            }
+
+        blockers = self._pi_thinkthread_pool_cleanup_blockers(run_id)
+        if blockers:
+            with self._run_transaction(run_id):
+                latest = self._load_run(run_id)
+                existing = next(
+                    (
+                        item
+                        for item in reversed(latest.fs_cleanup)
+                        if item.get("kind") == "snapshot_cleanup"
+                    ),
+                    None,
+                )
+                payload = {
+                    "kind": "snapshot_cleanup",
+                    "state": "deferred_pool_open",
+                    "pool_blockers": blockers,
+                    "updated_at": utc_timestamp(),
+                }
+                if existing is None:
+                    payload["created_at"] = payload["updated_at"]
+                    latest.fs_cleanup.append(payload)
+                else:
+                    existing.update(payload)
+                self._write_run(latest)
+            return {
+                "state": "deferred_pool_open",
+                "removed": [],
+                "pending": self._owned_pi_thinkthread_snapshots(run_id),
+                "pool_blockers": blockers,
+            }
+
+        client = self._agent_posix_client()
+        client.preflight()
+        terminal_request_ids = [
+            request.request_id
+            for request in self._load_run(run_id).fs_requests
+            if request.state in {"succeeded", "failed", "cancelled"}
+        ]
+        if terminal_request_ids:
+            self._close_fs_requests_after_evidence(
+                run_id, terminal_request_ids, client
+            )
+        removed: list[str] = []
+        pending: list[str] = []
+        failed: list[dict[str, str]] = []
+        for snapshot_id in self._owned_pi_thinkthread_snapshots(run_id):
+            request_id, cleanup_state = self._prepare_pi_thinkthread_snapshot_remove(
+                run_id, snapshot_id
+            )
+            if cleanup_state in {"removed", "already_absent"}:
+                removed.append(snapshot_id)
+                continue
+
+            persisted = next(
+                item
+                for item in self._load_run(run_id).fs_requests
+                if item.request_id == request_id
+            )
+            if persisted.state in {"succeeded", "closed"}:
+                self._update_pi_thinkthread_snapshot_cleanup(
+                    run_id,
+                    snapshot_id,
+                    state="removed",
+                    result=persisted.result or {},
+                )
+                self._close_fs_requests_after_evidence(
+                    run_id, [request_id], client
+                )
+                removed.append(snapshot_id)
+                continue
+
+            self._update_pi_thinkthread_snapshot_cleanup(
+                run_id, snapshot_id, state="removing"
+            )
+            try:
+                result = client.invoke(
+                    "fs.snapshot.remove",
+                    {"snapshotId": snapshot_id, "requestId": request_id},
+                    timeout_seconds=120.0,
+                )
+            except AgentPosixBridgeError as exc:
+                if exc.code == "FsSnapshotNotFound":
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="succeeded",
+                        result={"alreadyAbsent": True},
+                    )
+                    self._update_pi_thinkthread_snapshot_cleanup(
+                        run_id,
+                        snapshot_id,
+                        state="already_absent",
+                        result={"alreadyAbsent": True},
+                    )
+                    self._close_fs_requests_after_evidence(
+                        run_id, [request_id], client
+                    )
+                    removed.append(snapshot_id)
+                    continue
+                if exc.code == "FsSnapshotInUse":
+                    error = {
+                        "message": str(exc),
+                        "code": str(exc.code),
+                        "retryable": bool(exc.retryable),
+                    }
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="prepared",
+                        error=error,
+                    )
+                    self._update_pi_thinkthread_snapshot_cleanup(
+                        run_id,
+                        snapshot_id,
+                        state="deferred_in_use",
+                        error=error,
+                    )
+                    pending.append(snapshot_id)
+                    continue
+                try:
+                    result = self._recover_fs_request_result(
+                        client=client,
+                        run_id=run_id,
+                        request_id=request_id,
+                        operation="fs.snapshot.remove",
+                        deadline=time.monotonic() + 120.0,
+                    )
+                except (AgentPosixBridgeError, RuntimeError) as recovery_error:
+                    error = {
+                        "message": str(recovery_error),
+                        "code": str(
+                            getattr(recovery_error, "code", None) or exc.code or ""
+                        ),
+                    }
+                    state = (
+                        "needs_recovery"
+                        if exc.completion_unknown
+                        or "NeedsRecovery" in str(recovery_error)
+                        else "failed"
+                    )
+                    self._update_pi_thinkthread_snapshot_cleanup(
+                        run_id,
+                        snapshot_id,
+                        state=state,
+                        error=error,
+                    )
+                    pending.append(snapshot_id)
+                    failed.append({"snapshot_id": snapshot_id, **error})
+                    if state == "needs_recovery":
+                        with self._run_transaction(run_id):
+                            latest = self._load_run(run_id)
+                            if run.state != RunState.NEEDS_RECOVERY:
+                                latest.budget_used.setdefault(
+                                    "fs_cleanup_previous_state",
+                                    str(run.state),
+                                )
+                            latest.budget_used["fs_cleanup_recovery_active"] = True
+                            self._write_run(latest)
+                    continue
+                if result is None:
+                    error = {
+                        "message": str(exc),
+                        "code": str(exc.code or "RequestNotFound"),
+                    }
+                    self._update_fs_request(
+                        run_id,
+                        request_id,
+                        state="failed",
+                        error=error,
+                    )
+                    self._update_pi_thinkthread_snapshot_cleanup(
+                        run_id,
+                        snapshot_id,
+                        state="failed",
+                        error=error,
+                    )
+                    pending.append(snapshot_id)
+                    failed.append({"snapshot_id": snapshot_id, **error})
+                    continue
+            else:
+                self._update_fs_request(
+                    run_id, request_id, state="succeeded", result=result
+                )
+
+            self._update_pi_thinkthread_snapshot_cleanup(
+                run_id, snapshot_id, state="removed", result=result or {}
+            )
+            self._close_fs_requests_after_evidence(run_id, [request_id], client)
+            removed.append(snapshot_id)
+
+        storage: dict[str, Any] | None = None
+        try:
+            observed = client.invoke("fs.stat")
+            raw_storage = observed.get("storage")
+            storage = raw_storage if isinstance(raw_storage, dict) else None
+            self._record_pi_thinkthread_storage_observation(
+                run_id, state="observed", storage=storage
+            )
+        except AgentPosixBridgeError as exc:
+            self._record_pi_thinkthread_storage_observation(
+                run_id,
+                state="needs_recovery",
+                storage=None,
+                error=str(exc),
+            )
+
+        state = "complete" if not pending else "needs_recovery" if failed else "deferred"
+        with self._run_transaction(run_id):
+            latest = self._load_run(run_id)
+            summary = next(
+                (
+                    item
+                    for item in reversed(latest.fs_cleanup)
+                    if item.get("kind") == "snapshot_cleanup"
+                ),
+                None,
+            )
+            payload = {
+                "kind": "snapshot_cleanup",
+                "state": state,
+                "removed": removed,
+                "pending": pending,
+                "failed": failed,
+                "storage": storage,
+                "updated_at": utc_timestamp(),
+            }
+            if summary is None:
+                payload["created_at"] = payload["updated_at"]
+                latest.fs_cleanup.append(payload)
+            else:
+                summary.update(payload)
+                summary.pop("pool_blockers", None)
+            if state == "complete" and latest.budget_used.pop(
+                "fs_cleanup_recovery_active", None
+            ):
+                prior_state = latest.budget_used.pop(
+                    "fs_cleanup_previous_state", None
+                )
+                if (
+                    latest.state == RunState.NEEDS_RECOVERY
+                    and isinstance(prior_state, str)
+                ):
+                    latest.state = RunState(prior_state)
+                    latest.budget_used.pop("needs_recovery_reason", None)
+            self._write_run(latest)
+        return {
+            "state": state,
+            "removed": removed,
+            "pending": pending,
+            "failed": failed,
+            "storage": storage,
+        }
+
     def report(self, run_id: str) -> Path:
         blocking = self._blocking_goal_report_records(run_id)
         if blocking:
