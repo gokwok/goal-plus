@@ -3468,3 +3468,65 @@ def test_shared_tool_copy_patches_snapshot_resets_branch_and_wakes_child(
 
 @pytest.mark.pi
 def test_worker_rpc_rejects_message_sender_outside_bound_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(
+        FileSearchRuntime,
+        "_agent_posix_client",
+        lambda _runtime: client,
+    )
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    snapshot = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    pool_id = snapshot["pool_id"]
+    job_id = snapshot["jobs"][0]["job_id"]
+    child_id = snapshot["jobs"][0]["thinkthread_id"]
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    client.enqueue(
+        child_id,
+        {
+            "protocol": "goal-plus.pi-thinkthread.v2",
+            "type": "registration",
+            "registration_nonce": job["registration_nonce"],
+        },
+    )
+    client.enqueue(
+        child_id,
+        worker_request(
+            request_id="request-forged-sender",
+            agent_session_id=session.agent_session_id,
+            tool="search_list_iterations",
+            params={},
+        ),
+        sender="tt-sibling-forged",
+    )
+    result = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        timeout_seconds=3,
+        client=client,
+    )
+    assert result["event"]["kind"] == "failed"
+    job = _load_job(runtime.root_dir, pool_id, job_id)
+    assert job["error"]["stage"] == "message_validation"
+    assert "sender does not match" in job["error"]["message"]
+    assert job["settled_requests"] == {}
+    close_pool(
+        root_dir=runtime.root_dir,
+        pool_id=pool_id,
+        mode="drain",
+        client=client,
+    )
