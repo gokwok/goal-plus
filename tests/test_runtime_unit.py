@@ -178,6 +178,39 @@ def test_freeze_spec_is_stable_and_copies_verifier(tmp_path: Path) -> None:
     assert Path(first.frozen_verifier_paths["evaluator.py"]).exists()
 
 
+@pytest.mark.parametrize(
+    ("worker_host", "expected_start_new_session"),
+    [("codex", True), ("pi-rpc", True), ("pi-thinkthread", False)],
+)
+def test_freeze_preflight_stays_in_thinkthread_root_execution_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_host: str,
+    expected_start_new_session: bool,
+) -> None:
+    project = make_project(tmp_path)
+    payload = spec_for(project).model_dump(mode="json")
+    payload["strategy"] = {
+        "name": "random",
+        "worker_host": worker_host,
+    }
+    if worker_host == "pi-thinkthread":
+        payload.pop("workspace", None)
+    spec = SearchSpec.model_validate(payload)
+    runtime = FileSearchRuntime(tmp_path / f".search-{worker_host}")
+    original = runtime._execute_verifier_process
+    observed: list[bool] = []
+
+    def capture(command: list[str], **kwargs):
+        observed.append(kwargs["start_new_session"])
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(runtime, "_execute_verifier_process", capture)
+    runtime.freeze_spec(spec, [project / "evaluator.py"])
+
+    assert observed == [expected_start_new_session]
+
+
 def test_freeze_spec_rejects_verifier_workspace_side_effect_without_mutating_source(
     tmp_path: Path,
 ) -> None:
