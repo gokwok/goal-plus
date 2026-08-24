@@ -3648,6 +3648,196 @@ class FileSearchRuntime:
                 request_id,
             )
 
+    def _fs_score_report(
+        self,
+        *,
+        run: RunRecord,
+        record: CandidateRecord,
+        frozen: FrozenSpec,
+        results: list[VerifierResult],
+        scope: Literal["process", "promotion"],
+        touched_denied_files: bool,
+        changed_outside_allowed: bool,
+    ) -> ScoreReport:
+        hard_failed = any(
+            not result.passed
+            and result.role
+            in {
+                VerifierRole.VALIDITY_GATE,
+                VerifierRole.PROCESS_GATE,
+                VerifierRole.PROMOTION_GATE,
+                VerifierRole.ANTI_CHEAT_GATE,
+            }
+            for result in results
+        )
+        process_passed = not hard_failed and all(
+            result.passed or result.role == VerifierRole.DIAGNOSTIC_SIGNAL
+            for result in results
+        )
+        score = self._aggregate_score(frozen.spec.metric_name, results)
+        if not process_passed:
+            score = 0.0
+        return ScoreReport(
+            run_id=run.run_id,
+            candidate_id=record.candidate_id,
+            parent_id=record.task.parent_id,
+            validity_passed=process_passed,
+            process_passed=process_passed,
+            promotion_passed=process_passed if scope == "promotion" else None,
+            aggregate_score=score,
+            verifier_results=results,
+            touched_denied_files=touched_denied_files,
+            changed_outside_allowed=changed_outside_allowed,
+            hardcoding_suspected=False,
+        )
+
+    def _materialize_fs_tool_path(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        snapshot_id: str,
+        snapshot_path: str,
+        destination: Path,
+        usage: dict[str, int],
+        max_files: int,
+        max_bytes: int,
+        max_path_entries: int,
+        max_depth: int,
+        depth: int,
+    ) -> None:
+        if depth > max_depth:
+            raise ValueError(f"shared tool exceeds max depth {max_depth}")
+        entry = client.invoke(
+            "fs.snapshot.stat",
+            {"snapshotId": snapshot_id, "path": snapshot_path},
+        )
+        kind = entry.get("kind")
+        usage["paths"] += 1
+        if usage["paths"] > max_path_entries:
+            raise ValueError("shared tool exceeds path-entry limit")
+        if kind == "symlink":
+            raise ValueError("shared tool sources cannot contain symbolic links")
+        if kind == "file":
+            usage["files"] += 1
+            if usage["files"] > max_files:
+                raise ValueError("shared tool exceeds file limit")
+            remaining = max_bytes - usage["bytes"]
+            if remaining < 0:
+                raise ValueError("shared tool exceeds byte limit")
+            data = client.snapshot_read_file(
+                snapshot_id,
+                snapshot_path,
+                max_bytes=remaining,
+            )
+            usage["bytes"] += len(data)
+            if usage["bytes"] > max_bytes:
+                raise ValueError("shared tool exceeds byte limit")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            mode = entry.get("mode")
+            if isinstance(mode, int):
+                destination.chmod(mode & 0o777)
+            return
+        if kind != "directory":
+            raise ValueError(f"unsupported shared tool entry kind: {kind!r}")
+        destination.mkdir(parents=True, exist_ok=True)
+        for child in client.snapshot_readdir_all(snapshot_id, snapshot_path):
+            child_path = fs_path_text(child.get("path"))
+            child_posix = PurePosixPath(child_path)
+            if child_posix.parent != PurePosixPath(snapshot_path):
+                raise ValueError("snapshot readdir returned a non-immediate child")
+            self._materialize_fs_tool_path(
+                client=client,
+                snapshot_id=snapshot_id,
+                snapshot_path=child_path,
+                destination=destination / child_posix.name,
+                usage=usage,
+                max_files=max_files,
+                max_bytes=max_bytes,
+                max_path_entries=max_path_entries,
+                max_depth=max_depth,
+                depth=depth + 1,
+            )
+
+    def _settle_pi_thinkthread_shared_tools(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        attempt_ref: FsSnapshotArtifactRef,
+        iteration: int,
+        settlement_id: str | None = None,
+    ) -> SharedDirSettlement | None:
+        stages = list(record.pending_fs_tool_stages)
+        if not stages:
+            return None
+        limits = frozen.spec.shared_dir
+        run_dir = self._run_dir(run.run_id)
+        with tempfile.TemporaryDirectory(
+            prefix=f"fs-share-{record.candidate_id}-",
+            dir=run_dir,
+        ) as temporary:
+            share_out = Path(temporary) / "share-out"
+            share_out.mkdir()
+            usage = {"files": 0, "bytes": 0, "paths": 0}
+            for stage in stages:
+                destination = share_out / str(stage["staged_name"])
+                destination.mkdir()
+                usage["paths"] += 1
+                manifest = {
+                    "name": stage["name"],
+                    "summary": stage["summary"],
+                    "entrypoint": stage["entrypoint"],
+                }
+                manifest_bytes = (
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+                ).encode("utf-8")
+                usage["files"] += 1
+                usage["paths"] += 1
+                usage["bytes"] += len(manifest_bytes)
+                if (
+                    usage["files"] > limits.max_files_per_iteration
+                    or usage["paths"] > limits.max_path_entries_per_iteration
+                    or usage["bytes"] > limits.max_bytes_per_iteration
+                ):
+                    raise ValueError("staged shared tools exceed configured limits")
+                (destination / "manifest.json").write_bytes(manifest_bytes)
+                draft_prefix = PurePosixPath(TOOL_DRAFTS_RELATIVE_PATH)
+                for relative_source in stage["source_paths"]:
+                    source_path = PurePosixPath(relative_source)
+                    relative = source_path.relative_to(draft_prefix)
+                    snapshot_path = self._fs_join_path(
+                        run.fs_source_relative_path or ".",
+                        source_path.as_posix(),
+                    )
+                    self._materialize_fs_tool_path(
+                        client=client,
+                        snapshot_id=attempt_ref.snapshot_id,
+                        snapshot_path=snapshot_path,
+                        destination=destination / relative.as_posix(),
+                        usage=usage,
+                        max_files=limits.max_files_per_iteration,
+                        max_bytes=limits.max_bytes_per_iteration,
+                        max_path_entries=limits.max_path_entries_per_iteration,
+                        max_depth=limits.max_depth,
+                        depth=len(relative.parts),
+                    )
+            return SharedDirManager(run_dir).settle_iteration(
+                candidate_id=record.candidate_id,
+                iteration=iteration,
+                source_commit=None,
+                source_artifact_ref=attempt_ref,
+                share_out_dir=share_out,
+                max_tools=limits.max_tools_per_iteration,
+                max_files=limits.max_files_per_iteration,
+                max_bytes=limits.max_bytes_per_iteration,
+                max_path_entries=limits.max_path_entries_per_iteration,
+                max_depth=limits.max_depth,
+                settlement_id=settlement_id,
+            )
+
     def _settle_process_verifier(
         self,
         *,
