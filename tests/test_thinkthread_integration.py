@@ -1015,3 +1015,255 @@ def test_root_snapshot_request_recovers_after_goal_plus_process_crash(
 
 
 @pytest.mark.pi
+def test_snapshot_recovery_does_not_clear_an_unrelated_recovery_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    with runtime._run_transaction(run_id):
+        run = runtime._load_run(run_id)
+        run.state = RunState.NEEDS_RECOVERY
+        run.budget_used["fs_recovery_previous_state"] = RunState.RUNNING.value
+        run.budget_used["needs_recovery_reason"] = (
+            "publication request req-unrelated requires reconciliation"
+        )
+        runtime._write_run(run)
+
+    recovered = runtime.recover_pi_thinkthread_snapshot_requests(run_id)
+
+    run = runtime._load_run(run_id)
+    assert recovered["failed"] == []
+    assert run.state == RunState.NEEDS_RECOVERY
+    assert "publication request" in run.budget_used["needs_recovery_reason"]
+
+
+@pytest.mark.pi
+def test_terminal_root_snapshot_failure_is_failed_not_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    client.snapshot_create_terminal_failure_once = True
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+
+    with pytest.raises(Exception, match="snapshot capture failed|request failed"):
+        runtime.create_run(frozen.frozen_spec_id)
+
+    run_dirs = list((runtime.root_dir / "runs").glob("run_*"))
+    assert len(run_dirs) == 1
+    run = runtime._load_run(run_dirs[0].name)
+    assert run.state == RunState.FAILED
+    assert run.fs_snapshot_intents[0].state == "failed"
+    assert run.fs_requests[0].state == "failed"
+
+
+@pytest.mark.pi
+def test_terminal_branch_snapshot_failure_is_failed_not_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeVerifierAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    task = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=1).plan_id,
+    )[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    opened = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    client.branch_snapshot_terminal_failure_once = True
+
+    with pytest.raises(Exception, match="branch snapshot capture failed|request failed"):
+        runtime.run_verifier(
+            run_id,
+            task.candidate_id,
+            agent_session_id=session.agent_session_id,
+            hypothesis="capture terminal failure",
+        )
+
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    assert record.fs_snapshot_intents[-1].state == "failed"
+    request = runtime._load_run(run_id).fs_requests[-1]
+    assert request.operation == "branch_snapshot"
+    assert request.state == "failed"
+
+
+@pytest.mark.pi
+def test_terminal_shared_copy_snapshot_failure_marks_requirement_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TerminalCaptureFailureRuntime:
+        def capture_pi_thinkthread_branch_snapshot(self, **_kwargs):
+            raise AgentPosixBridgeError(
+                "shared copy snapshot capture failed",
+                error={
+                    "response": {
+                        "error": {
+                            "code": "FsSnapshotCaptureFailed",
+                            "message": "shared copy snapshot capture failed",
+                        }
+                    }
+                },
+            )
+
+    job = {
+        "job_id": "job-shared-copy",
+        "run_id": "run-shared-copy",
+        "candidate_id": "c001",
+        "fs_branch_id": "fsbr-shared-copy",
+        "copy_requirements": [
+            {"state": "copy_required", "receipt_id": "copy-receipt"}
+        ],
+    }
+    monkeypatch.setattr(
+        thinkthread_pool,
+        "_ensure_branch_mutation_execution_absent",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        thinkthread_pool,
+        "_write_job",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(AgentPosixBridgeError, match="snapshot capture failed"):
+        thinkthread_pool._apply_job_tool_copies(
+            TerminalCaptureFailureRuntime(),
+            object(),
+            tmp_path,
+            "pool-shared-copy",
+            job,
+        )
+
+    requirement = job["copy_requirements"][0]
+    assert requirement["state"] == "failed"
+    assert "snapshot capture failed" in requirement["error"]
+
+
+@pytest.mark.pi
+def test_pool_spawns_private_message_only_children_from_same_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = FakeRootAgentPosixClient()
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=2)
+    tasks = runtime.start_batch(run_id, plan.plan_id)
+    assert runtime._load_agent_sessions(run_id) == []
+
+    snapshot = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id for task in tasks],
+        client=client,
+    )
+    sessions = sorted(
+        runtime._load_agent_sessions(run_id),
+        key=lambda item: item.candidate_id,
+    )
+
+    assert snapshot["host"] == "pi-thinkthread"
+    assert snapshot["active_count"] == 2
+    assert snapshot["free_slots"] == 0
+    assert snapshot["terminal_count"] == 0
+    assert snapshot["undelivered_terminal_count"] == 0
+    assert len(client.spawn_params) == 2
+    assert {item["fsSnapshotId"] for item in client.spawn_params} == {
+        "fsnap-baseline"
+    }
+    assert all(item["fs"] == "private" for item in client.spawn_params)
+    assert all(
+        item["capabilities"] == ["thinkthread.message"]
+        for item in client.spawn_params
+    )
+    for task, session in zip(tasks, sessions, strict=True):
+        record = runtime._load_candidate_record(run_id, task.candidate_id)
+        bound = runtime._load_agent_session_by_id(session.agent_session_id)
+        assert record.task.fs_branch_id is not None
+        assert bound.host_handle.external_id is not None
+
+
+@pytest.mark.pi
+def test_pool_settles_completed_wake_while_retained_runtime_stays_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    plan = runtime.plan_next(run_id, requested_k=1)
+    task = runtime.start_batch(run_id, plan.plan_id)[0]
+    runtime.start_agent_session(run_id, task.candidate_id)
+    pool = open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        final_verify=False,
+        client=client,
+    )
+    job = _load_job(
+        runtime.root_dir,
+        pool["pool_id"],
+        pool["jobs"][0]["job_id"],
+    )
+    child = client._child(job["thinkthread_id"])
+    child.update(
+        {
+            "agentState": "ready",
+            "executionState": "running",
+            "pendingWake": False,
+            "lastWakeOutcome": {
+                "messageId": job["active_message_id"],
+                "outcome": "completed",
+                "finishedAtUnixMs": 1,
+            },
+        }
+    )
+
+    completed = wait_any(
+        root_dir=runtime.root_dir,
+        pool_id=pool["pool_id"],
+        timeout_seconds=1,
+        client=client,
+    )
+
+    assert completed["event"]["kind"] == "candidate_ready"
+    settled = _load_job(
+        runtime.root_dir,
+        pool["pool_id"],
+        pool["jobs"][0]["job_id"],
+    )
+    assert settled["wake_outcome"]["messageId"] == job["active_message_id"]
+    assert client._child(job["thinkthread_id"])["executionState"] == "running"
+
+
+@pytest.mark.pi
