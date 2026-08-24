@@ -3394,6 +3394,260 @@ class FileSearchRuntime:
                 }
         return failures
 
+    def _fs_run_verifier_command(
+        self,
+        *,
+        client: AgentPosixSdkClient,
+        reader: FsSnapshotArtifactReader,
+        run: RunRecord,
+        frozen: FrozenSpec,
+        record: CandidateRecord,
+        artifact: FsSnapshotArtifactRef,
+        command: VerifierCommand,
+        verifier_phase: Literal["candidate", "promotion"],
+        idempotency_key: str | None = None,
+    ) -> tuple[VerifierResult, str | None]:
+        if command.command[0] == "goal-plus-internal":
+            return (
+                self._fs_internal_verifier(
+                    reader=reader,
+                    artifact=artifact,
+                    source_prefix=run.fs_source_relative_path or ".",
+                    frozen=frozen,
+                    command=command,
+                ),
+                None,
+            )
+        current_run = self._load_run(run.run_id)
+        existing = next(
+            (
+                item
+                for item in current_run.fs_requests
+                if idempotency_key is not None
+                and item.operation == "run"
+                and item.context.get("rpc_request_id") == idempotency_key
+                and item.context.get("verifier") == command.name
+                and item.context.get("phase") == verifier_phase
+            ),
+            None,
+        )
+        if existing is None:
+            request_id = new_request_id()
+            now = utc_timestamp()
+            self._append_fs_request(
+                run.run_id,
+                FsRequestRecord(
+                    request_id=request_id,
+                    operation="run",
+                    context={
+                        "candidate_id": record.candidate_id,
+                        "snapshot_id": artifact.snapshot_id,
+                        "verifier": command.name,
+                        "phase": verifier_phase,
+                        **(
+                            {"rpc_request_id": idempotency_key}
+                            if idempotency_key is not None
+                            else {}
+                        ),
+                    },
+                    created_at=now,
+                    updated_at=now,
+                ),
+            )
+            existing_result: dict[str, Any] | None = None
+        else:
+            if (
+                existing.context.get("candidate_id") != record.candidate_id
+                or existing.context.get("snapshot_id") != artifact.snapshot_id
+            ):
+                raise RuntimeError(
+                    "verifier idempotency key changed candidate or snapshot"
+                )
+            request_id = existing.request_id
+            existing_result = (
+                existing.result
+                if existing.state in {"succeeded", "closed"}
+                and isinstance(existing.result, dict)
+                else None
+            )
+        logs_dir = (
+            self._candidate_dir(run.run_id, record.candidate_id)
+            / "logs"
+            / ("process" if verifier_phase == "candidate" else "promotion")
+        )
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = logs_dir / (
+            f"iteration-{len(record.iterations) + 1:04d}-"
+            f"{safe_verifier_name(command.name)}-{uuid.uuid4().hex[:8]}.log"
+        )
+        source_prefix = run.fs_source_relative_path or "."
+        argv = [
+            sys.executable,
+            "-m",
+            "goal_plus.revision_verifier",
+            "--source-path",
+            source_prefix,
+            "--cwd",
+            command.cwd,
+            "--phase",
+            verifier_phase,
+            "--",
+            *command.command,
+        ]
+        fs_environment = {"PATH": os.environ.get("PATH", os.defpath)}
+        virtual_env = os.environ.get("VIRTUAL_ENV")
+        if virtual_env:
+            fs_environment["VIRTUAL_ENV"] = virtual_env
+        params = {
+            "snapshotId": artifact.snapshot_id,
+            "invocation": {
+                "argv": argv,
+                "cwd": ".",
+                "environment": fs_environment,
+            },
+            "writes": "discard",
+            "limits": {
+                "timeoutMs": command.timeout_seconds * 1000,
+                "maxOutputBytes": VERIFIER_OUTPUT_LIMIT_BYTES,
+            },
+            "requestId": request_id,
+        }
+        start = time.perf_counter()
+        try:
+            with verifier_resource_lock(command.resource_lock):
+                result = existing_result or self._invoke_durable_fs_run(
+                    client=client,
+                    run_id=run.run_id,
+                    request_id=request_id,
+                    params=params,
+                    timeout_seconds=command.timeout_seconds,
+                )
+                stdout, stderr = self._decode_fs_run_output(result)
+                elapsed = time.perf_counter() - start
+                metrics = self._parse_metrics(stdout)
+                returncode, exit_failure = self._fs_exit_status(result)
+                metrics.setdefault("returncode", returncode)
+                metrics.setdefault("elapsed_seconds", elapsed)
+                metrics["fs_execution_metrics"] = result.get("metrics", {})
+                metrics["retained_output_bytes"] = result.get("retainedOutputBytes")
+                metrics["observed_output_bytes"] = result.get("observedOutputBytes")
+                truncated = result.get("outputTruncated") is True
+                score = self._score_from_metrics(frozen.spec.metric_name, metrics)
+                has_verifier_error = self._has_verifier_error(metrics)
+                missing_numeric_metric = (
+                    returncode == 0
+                    and not has_verifier_error
+                    and command.role == VerifierRole.RANKING_SIGNAL
+                    and score is None
+                )
+                if missing_numeric_metric:
+                    metrics["expected_metric_name"] = frozen.spec.metric_name
+                if truncated:
+                    metrics["infrastructure_failure"] = True
+                    metrics["candidate_action"] = "stop_and_report"
+                passed = bool(
+                    returncode == 0
+                    and exit_failure is None
+                    and not truncated
+                    and not has_verifier_error
+                    and not missing_numeric_metric
+                )
+                failure_class = (
+                    None
+                    if passed
+                    else "VerifierInfrastructureFailure"
+                    if truncated
+                    else "MissingNumericMetric"
+                    if missing_numeric_metric
+                    else exit_failure
+                    or "VerifierCommandFailed"
+                )
+                if not passed:
+                    self._add_visible_verifier_feedback(
+                        command,
+                        metrics,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                log_path.write_text(
+                    _bounded_log(
+                        "\n".join(
+                            [
+                                f"$ {' '.join(command.command)}",
+                                f"snapshot: {artifact.snapshot_id}",
+                                f"request_id: {request_id}",
+                                f"returncode: {returncode}",
+                                f"exit: {result.get('exit')}",
+                                f"output_truncated: {truncated}",
+                                "",
+                                "## stdout",
+                                stdout,
+                                "## stderr",
+                                stderr,
+                            ]
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return (
+                    VerifierResult(
+                        name=command.name,
+                        role=command.role,
+                        passed=passed,
+                        score=score,
+                        metrics=metrics,
+                        log_path=log_path,
+                        failure_class=failure_class,
+                    ),
+                    request_id,
+                )
+        except AgentPosixBridgeError as exc:
+            # The durable request record already distinguishes a terminal
+            # platform failure from completion-unknown recovery. Surface the
+            # former as verifier infrastructure Evidence so the worker can
+            # react and the terminal RequestId can be closed after that
+            # Evidence is persisted. RuntimeError remains reserved for the
+            # explicit needs_recovery path below.
+            log_path.write_text(_bounded_log(str(exc)), encoding="utf-8")
+            return (
+                VerifierResult(
+                    name=command.name,
+                    role=command.role,
+                    passed=False,
+                    score=0.0,
+                    metrics={
+                        "error": str(exc),
+                        "error_code": exc.code,
+                        "retryable": exc.retryable,
+                        "infrastructure_failure": True,
+                        "candidate_action": "stop_and_report",
+                    },
+                    log_path=log_path,
+                    failure_class="VerifierInfrastructureFailure",
+                ),
+                request_id,
+            )
+        except RuntimeError:
+            raise
+        except ValueError as exc:
+            log_path.write_text(_bounded_log(str(exc)), encoding="utf-8")
+            return (
+                VerifierResult(
+                    name=command.name,
+                    role=command.role,
+                    passed=False,
+                    score=0.0,
+                    metrics={
+                        "error": str(exc),
+                        "infrastructure_failure": True,
+                        "candidate_action": "stop_and_report",
+                    },
+                    log_path=log_path,
+                    failure_class="VerifierInfrastructureFailure",
+                ),
+                request_id,
+            )
+
     def _settle_process_verifier(
         self,
         *,
