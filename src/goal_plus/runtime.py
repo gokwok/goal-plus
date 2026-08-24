@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import base64
 import calendar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,7 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
     import tomli as tomllib
 import uuid
 from fnmatch import fnmatch
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 try:
@@ -44,9 +46,13 @@ from goal_plus.models import (
     EvidenceAnnotationTask,
     FeedbackPolicy,
     EvidenceViewRecord,
+    FsSnapshotArtifactRef,
+    FsSnapshotCreationIntent,
+    FsRequestRecord,
     FrozenSpec,
     GlobalEvidenceReadRecord,
     GlobalEvidenceViewReference,
+    GitCommitArtifactRef,
     IterationDisposition,
     PromotionEvidence,
     RunRecord,
@@ -54,6 +60,7 @@ from goal_plus.models import (
     RunSummary,
     IterationRecord,
     ModelSpec,
+    PublicationIntent,
     SelectedModel,
     ResultLedgerEntry,
     ResolvedCodexProvider,
@@ -80,6 +87,7 @@ from goal_plus.shared_dir import (
     TOOL_INBOX_RELATIVE_PATH,
     TOOL_VIEW_MAX_CONTENT_BYTES,
     SharedDirManager,
+    SharedDirSettlement,
 )
 from goal_plus.workspaces import (
     IGNORED_NAMES,
@@ -89,6 +97,16 @@ from goal_plus.workspaces import (
     list_files,
     list_source_files,
     materialize_candidate_workspace,
+)
+from goal_plus.thinkthread_agent_posix import (
+    AgentPosixBridgeError,
+    AgentPosixSdkClient,
+    new_request_id,
+)
+from goal_plus.artifacts import (
+    FsSnapshotArtifactReader,
+    GitArtifactReader,
+    fs_path_text,
 )
 
 
@@ -118,6 +136,7 @@ SUPPLEMENTAL_EVALUATION_ENABLED_ENV = (
 SUPPLEMENTAL_EVALUATION_REQUIRED_ENV = (
     "GOAL_PLUS_SUPPLEMENTAL_EVALUATION_REQUIRED"
 )
+_UNSET = object()
 
 
 def _boolean_environment_value(
@@ -171,6 +190,20 @@ class _CandidateArtifactState:
     git_artifact_clean: bool
 
 
+@dataclass(frozen=True)
+class _FsAttemptState:
+    base_ref: FsSnapshotArtifactRef
+    attempt_ref: FsSnapshotArtifactRef
+    changed_files: list[str]
+    actual_diff: str
+    cumulative_diff: str
+    touched_denied_files: bool
+    changed_outside_allowed: bool
+    artifact_hash: str
+    continuation_required: bool
+    snapshot_request_id: str | None = None
+
+
 class _BoundedOutput:
     def __init__(self, limit: int = VERIFIER_OUTPUT_LIMIT_BYTES) -> None:
         self.limit = limit
@@ -204,6 +237,17 @@ def _bounded_log(value: str) -> str:
     marker = b"[... log truncated ...]\n"
     tail = encoded[-(VERIFIER_LOG_LIMIT_BYTES - len(marker)) :]
     return (marker + tail).decode("utf-8", errors="replace")
+
+
+def _bounded_projection(value: str | None, max_bytes: int) -> str | None:
+    if value is None:
+        return None
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    marker = b"\n[diff projection truncated]\n"
+    retained = encoded[: max(0, max_bytes - len(marker))]
+    return (retained + marker).decode("utf-8", errors="replace")
 
 
 def _verifier_output_tail_detail(stdout: str, stderr: str) -> str:
@@ -390,7 +434,7 @@ class FileSearchRuntime:
 
     def list_available_models(
         self,
-        host: Literal["codex", "pi-rpc"],
+        host: Literal["codex", "pi-rpc", "pi-thinkthread"],
         query: str | None = None,
     ) -> dict[str, Any]:
         adapter = get_agent_host_adapter(host)
@@ -399,6 +443,10 @@ class FileSearchRuntime:
             "adapter_version": adapter.adapter_version,
             "models": adapter.list_available_models(query),
         }
+
+    @staticmethod
+    def _agent_posix_client() -> AgentPosixSdkClient:
+        return AgentPosixSdkClient()
 
     @staticmethod
     def _match_available_model(
@@ -490,6 +538,7 @@ class FileSearchRuntime:
         capture_output: bool,
         timeout: int,
         check: bool,
+        start_new_session: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         if not text or not capture_output:
             raise ValueError("verifier processes require text capture")
@@ -500,7 +549,7 @@ class FileSearchRuntime:
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=start_new_session,
         )
         stdout_capture = _BoundedOutput()
         stderr_capture = _BoundedOutput()
@@ -754,6 +803,9 @@ class FileSearchRuntime:
                                 capture_output=True,
                                 timeout=command.timeout_seconds,
                                 check=False,
+                                start_new_session=(
+                                    spec.strategy.worker_host != "pi-thinkthread"
+                                ),
                             )
                 except subprocess.TimeoutExpired as exc:
                     stdout = exc.stdout if isinstance(exc.stdout, str) else ""
@@ -919,6 +971,157 @@ class FileSearchRuntime:
             return None
         return plan.selected_models[slot - 1]
 
+    @staticmethod
+    def _capability_ids(view: dict[str, Any]) -> set[str]:
+        raw = view.get("capabilities")
+        if not isinstance(raw, list):
+            return set()
+        return {
+            str(item["id"])
+            for item in raw
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+
+    @staticmethod
+    def _fs_source_relative_path(source_path: str) -> str:
+        source = Path(source_path).resolve()
+        execution_root = Path.cwd().resolve()
+        try:
+            relative = source.relative_to(execution_root)
+        except ValueError as exc:
+            raise ValueError(
+                "pi-thinkthread source_path must be within the Root execution "
+                f"workspace {execution_root}: {source}"
+            ) from exc
+        return relative.as_posix() if relative.parts else "."
+
+    def _create_pi_thinkthread_baseline(self, run: RunRecord) -> RunRecord:
+        now = utc_timestamp()
+        request_id = new_request_id()
+        intent = FsSnapshotCreationIntent(
+            intent_id=f"snapshot-intent-{uuid.uuid4()}",
+            operation="root_snapshot",
+            request_id=request_id,
+            state="prepared",
+            purpose="initial_baseline",
+            created_at=now,
+            updated_at=now,
+        )
+        run.fs_source_relative_path = self._fs_source_relative_path(run.source_path)
+        run.fs_snapshot_intents.append(intent)
+        run.fs_requests.append(
+            FsRequestRecord(
+                request_id=request_id,
+                operation="root_snapshot",
+                context={"purpose": "initial_baseline"},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self._write_run(run)
+
+        client = self._agent_posix_client()
+        client.preflight()
+        self_view = client.self_view()
+        if self_view.get("parentThinkthreadId") is not None:
+            raise RuntimeError(
+                "pi-thinkthread Search run baseline must be created by a Root Agent"
+            )
+        missing = {
+            "thinkthread.child",
+            "thinkthread.message",
+            "thinkthread.fs",
+        } - self._capability_ids(self_view)
+        if missing:
+            raise RuntimeError(
+                "pi-thinkthread Root lacks required capabilities: "
+                + ", ".join(sorted(missing))
+            )
+        fs_view = client.invoke("fs.stat")
+        if fs_view.get("kind") != "direct":
+            raise RuntimeError(
+                "pi-thinkthread Root Profile must use rootFsMode=direct"
+            )
+
+        intent.state = "platform_mutation_started"
+        intent.updated_at = utc_timestamp()
+        self._write_run(run)
+        try:
+            snapshot = self._invoke_durable_fs_operation(
+                client=client,
+                run_id=run.run_id,
+                request_id=request_id,
+                method="fs.snapshot.create",
+                params={"requestId": request_id},
+                timeout_seconds=120,
+            )
+        except AgentPosixBridgeError as exc:
+            with self._run_transaction(run.run_id):
+                latest = self._load_run(run.run_id)
+                current_intent = next(
+                    item
+                    for item in latest.fs_snapshot_intents
+                    if item.intent_id == intent.intent_id
+                )
+                current_intent.state = "failed"
+                current_intent.updated_at = utc_timestamp()
+                latest.state = RunState.FAILED
+                latest.budget_used["baseline_snapshot_error"] = {
+                    "request_id": request_id,
+                    "error_code": exc.code,
+                    "message": str(exc),
+                }
+                self._write_run(latest)
+            raise
+        except RuntimeError:
+            with self._run_transaction(run.run_id):
+                latest = self._load_run(run.run_id)
+                current_intent = next(
+                    item
+                    for item in latest.fs_snapshot_intents
+                    if item.intent_id == intent.intent_id
+                )
+                current_intent.state = "needs_recovery"
+                current_intent.updated_at = utc_timestamp()
+                self._write_run(latest)
+            raise
+        snapshot_id = snapshot.get("snapshotId")
+        if not isinstance(snapshot_id, str) or not snapshot_id.startswith("fsnap-"):
+            with self._run_transaction(run.run_id):
+                latest = self._load_run(run.run_id)
+                current_intent = next(
+                    item
+                    for item in latest.fs_snapshot_intents
+                    if item.intent_id == intent.intent_id
+                )
+                current_intent.state = "needs_recovery"
+                current_intent.updated_at = utc_timestamp()
+                latest.state = RunState.NEEDS_RECOVERY
+                latest.budget_used["needs_recovery_reason"] = (
+                    f"fs.snapshot.create request {request_id} returned no snapshotId"
+                )
+                self._write_run(latest)
+            raise RuntimeError(
+                f"pi-thinkthread run {run.run_id} baseline snapshot omitted snapshotId"
+            )
+        with self._run_transaction(run.run_id):
+            latest = self._load_run(run.run_id)
+            current_intent = next(
+                item
+                for item in latest.fs_snapshot_intents
+                if item.intent_id == intent.intent_id
+            )
+            current_intent.state = "created"
+            current_intent.snapshot_id = snapshot_id
+            current_intent.updated_at = utc_timestamp()
+            latest.baseline_artifact_ref = FsSnapshotArtifactRef(
+                snapshot_id=snapshot_id
+            )
+            latest.budget_used.pop("needs_recovery_reason", None)
+            self._write_run(latest)
+        self._close_fs_requests_after_evidence(run.run_id, [request_id], client)
+        return self._load_run(run.run_id)
+
     def create_run(
         self,
         frozen_spec_id: str,
@@ -953,9 +1156,12 @@ class FileSearchRuntime:
         )
         self._write_run(run)
         (self._run_dir(run_id) / "candidates").mkdir(parents=True, exist_ok=True)
-        (self._run_dir(run_id) / "workspace").mkdir(parents=True, exist_ok=True)
+        if frozen.spec.strategy.worker_host != "pi-thinkthread":
+            (self._run_dir(run_id) / "workspace").mkdir(parents=True, exist_ok=True)
         (self._run_dir(run_id) / "plans").mkdir(parents=True, exist_ok=True)
         (self._run_dir(run_id) / "agent_sessions").mkdir(parents=True, exist_ok=True)
+        if frozen.spec.strategy.worker_host == "pi-thinkthread":
+            run = self._create_pi_thinkthread_baseline(run)
         if source_run_id:
             with self._run_transaction(source_run_id):
                 source_run = self._load_run(source_run_id)
