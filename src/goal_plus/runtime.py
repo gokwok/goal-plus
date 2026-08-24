@@ -7953,6 +7953,12 @@ class FileSearchRuntime:
         return str(score)
 
     def _read_results_tsv(self, record: CandidateRecord) -> list[ResultLedgerEntry]:
+        # pi-thinkthread candidates are backed by a private ThinkThread fs
+        # branch and intentionally have no host-visible ``workspace`` path.
+        # Their durable ledger is populated from exact FsSnapshot-backed
+        # iterations, never from the legacy Git workspace/results.tsv file.
+        if record.task.workspace is None:
+            return []
         paths = (
             self._results_tsv_path(record.task.workspace),
             self._legacy_results_tsv_path(record.task.workspace),
@@ -8011,6 +8017,13 @@ class FileSearchRuntime:
                     source_run_id=record.task.run_id,
                     source_candidate_id=record.candidate_id,
                     iteration=iteration.iteration if iteration else None,
+                    artifact_ref=(
+                        iteration.attempt_ref
+                        if iteration is not None and iteration.attempt_ref is not None
+                        else GitCommitArtifactRef(commit=git_head.strip())
+                        if git_head.strip()
+                        else None
+                    ),
                     git_head=git_head.strip() or None,
                     ledger_git_head=iteration.ledger_git_head if iteration else None,
                     metric_name=metric_name,
@@ -8028,6 +8041,14 @@ class FileSearchRuntime:
                     source_run_id=record.task.run_id,
                     source_candidate_id=record.candidate_id,
                     iteration=iteration.iteration,
+                    artifact_ref=(
+                        iteration.attempt_ref
+                        or (
+                            GitCommitArtifactRef(commit=iteration.git_head)
+                            if iteration.git_head is not None
+                            else None
+                        )
+                    ),
                     git_head=iteration.git_head,
                     ledger_git_head=iteration.ledger_git_head,
                     metric_name=metric_name,
@@ -8061,6 +8082,14 @@ class FileSearchRuntime:
                     source_run_id=record.task.run_id,
                     source_candidate_id=record.candidate_id,
                     iteration=iteration.iteration,
+                    artifact_ref=(
+                        iteration.attempt_ref
+                        or (
+                            GitCommitArtifactRef(commit=iteration.git_head)
+                            if iteration.git_head is not None
+                            else None
+                        )
+                    ),
                     git_head=iteration.git_head,
                     ledger_git_head=iteration.ledger_git_head,
                     metric_name=metric_name,
@@ -8206,7 +8235,11 @@ class FileSearchRuntime:
     ) -> Path:
         if record.results_ledger_git_head is not None:
             return self._assert_results_tsv_unchanged(record, metric_name)
-        if not record.results_ledger and record.results_ledger_git_head is None:
+        if (
+            record.task.workspace is not None
+            and not record.results_ledger
+            and record.results_ledger_git_head is None
+        ):
             record.results_ledger = self._read_results_tsv(record)
         if record.results_ledger_git_head is None:
             self._backfill_results_ledger_from_iterations(record, metric_name)
@@ -8889,9 +8922,11 @@ class FileSearchRuntime:
             self._run_dir(run.run_id).resolve()
         )
         best = BestArtifactRecord(
+            schema_version=2,
             run_id=run.run_id,
             candidate_id=record.candidate_id,
             iteration=iteration.iteration,
+            artifact_ref=GitCommitArtifactRef(commit=str(iteration.git_head)),
             commit=str(iteration.git_head),
             score=float(iteration.score),
             metric_name=spec.metric_name,
@@ -8934,6 +8969,8 @@ class FileSearchRuntime:
         return any(
             view.tool_id == tool.tool_id
             and view.snapshot_hash == tool.snapshot_hash
+            and view.source_artifact_ref
+            == (tool.source_artifact_ref or task.attempt_ref)
             and view.source_commit == (tool.source_commit or task.attempt_commit)
             for view in task.view.tool_views
         )
