@@ -1526,3 +1526,253 @@ def _event(pool: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
             "error": job.get("error"),
         },
     ).as_dict()
+
+
+def _run_turn_boundary_final_verifier(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool_id: str,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    boundary = job.get("final_verifier_boundary")
+    if not isinstance(boundary, dict):
+        boundary = {
+            "state": "prepared",
+            "message_id": job.get("active_message_id"),
+            "idempotency_key": (
+                f"final-{pool_id}-{job['job_id']}-{job.get('active_message_id') or 'turn'}"
+            ),
+            "prepared_at": utc_timestamp(),
+        }
+        job["final_verifier_boundary"] = boundary
+        _write_job(root_dir, pool_id, job)
+    elif not isinstance(boundary.get("idempotency_key"), str):
+        boundary["idempotency_key"] = (
+            f"final-{pool_id}-{job['job_id']}-{boundary.get('message_id') or 'turn'}"
+        )
+        _write_job(root_dir, pool_id, job)
+    if not _ensure_branch_mutation_execution_absent(
+        sdk,
+        root_dir,
+        pool_id,
+        job,
+    ):
+        boundary["state"] = "stop_needs_recovery"
+        boundary["updated_at"] = utc_timestamp()
+        _write_job(root_dir, pool_id, job)
+        raise RuntimeError(
+            "turn-boundary verifier could not stop retained Child execution"
+        )
+    boundary["state"] = "platform_mutation_started"
+    boundary["started_at"] = utc_timestamp()
+    _write_job(root_dir, pool_id, job)
+    report = runtime.finalize_pi_thinkthread_candidate(
+        run_id=str(job["run_id"]),
+        candidate_id=str(job["candidate_id"]),
+        agent_session_id=str(job["agent_session_id"]),
+        idempotency_key=str(boundary["idempotency_key"]),
+    )
+    job["verifier_runs"] = int(job.get("verifier_runs", 0)) + 1
+    payload = report.model_dump(mode="json")
+    job["final_verifier"] = {
+        "iteration": payload.get("best_iteration"),
+        "disposition": payload.get("disposition"),
+        "process_passed": payload.get("process_passed"),
+        "aggregate_score": payload.get("aggregate_score"),
+        "recorded_at": utc_timestamp(),
+    }
+    boundary["state"] = "settled"
+    boundary["settled_at"] = utc_timestamp()
+    if payload.get("disposition") in {"discard", "failure"}:
+        target = payload.get("workspace_artifact_after_settlement")
+        target_id = target.get("snapshot_id") if isinstance(target, dict) else None
+        if not isinstance(target_id, str):
+            raise RuntimeError("final verifier settlement omitted restore snapshot")
+        job["restore_required"] = {
+            "state": "restore_required",
+            "target_snapshot_id": target_id,
+            "requested_at": utc_timestamp(),
+        }
+        _require_turn_boundary_wake(job, "final_verifier_restore")
+    return payload
+
+
+def _stop_child_for_deadline(
+    sdk: AgentPosixSdkClient,
+    job: dict[str, Any],
+) -> bool:
+    child_id = job.get("thinkthread_id")
+    if not isinstance(child_id, str):
+        return False
+    for signal_name in ("INT", "TERM"):
+        sdk.invoke("thinkthread.signal", {"id": child_id, "signal": signal_name})
+        child = _wait_for_execution_absent(
+            sdk,
+            child_id,
+            CHILD_DEADLINE_GRACE_SECONDS,
+        )
+        if child is not None:
+            job["completion"] = child.get("completion")
+            return True
+    observed = sdk.invoke("thinkthread.get", {"id": child_id})
+    return observed.get("executionState") == "absent"
+
+
+def _wake_for_minimum_lease(
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool_id: str,
+    job: dict[str, Any],
+) -> None:
+    session = runtime.continue_agent_session(
+        str(job["agent_session_id"]),
+        worker_budget=_remaining_worker_budget(job),
+    )
+    _send_retained_wake(
+        sdk=sdk,
+        root_dir=root_dir,
+        pool_id=pool_id,
+        job=job,
+        message=str(session.launch["message"]),
+        stage="lease_wake",
+    )
+    if job.get("status") == "running":
+        job["lease_wakes"] = int(job.get("lease_wakes", 0)) + 1
+        job["last_wake_at"] = utc_timestamp()
+        _write_job(root_dir, pool_id, job)
+
+
+def _remaining_worker_budget(job: dict[str, Any]) -> dict[str, Any]:
+    configured = job.get("worker_budget")
+    if not isinstance(configured, dict):
+        raise RuntimeError("pi-thinkthread pool job omitted worker_budget")
+    remaining_seconds = max(
+        1,
+        math.ceil(_lease_deadline_epoch(job) - time.time()),
+    )
+    result = {
+        key: value
+        for key, value in configured.items()
+        if key in {"max_turns", "on_exceed"} and value is not None
+    }
+    result["max_runtime_seconds"] = remaining_seconds
+    elapsed = max(0.0, time.time() - _lease_started_epoch(job))
+    remaining_min_runtime = max(
+        0,
+        math.ceil(float(configured.get("min_runtime_seconds") or 0) - elapsed),
+    )
+    if 0 < remaining_min_runtime < remaining_seconds:
+        result["min_runtime_seconds"] = remaining_min_runtime
+    remaining_verifiers = max(
+        0,
+        int(configured.get("min_verifier_runs") or 0)
+        - max(
+            0,
+            int(job.get("verifier_runs", 0))
+            - int(job.get("lease_start_verifier_runs", 0)),
+        ),
+    )
+    if remaining_verifiers:
+        result["min_verifier_runs"] = remaining_verifiers
+    return result
+
+
+def _wake_after_turn_boundary(
+    *,
+    runtime: FileSearchRuntime,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool_id: str,
+    job: dict[str, Any],
+) -> None:
+    intent = job.get("turn_boundary_wake_required")
+    if not isinstance(intent, dict):
+        return
+    session = runtime.continue_agent_session(
+        str(job["agent_session_id"]),
+        worker_budget=_remaining_worker_budget(job),
+    )
+    intent["state"] = "waking"
+    intent["wake_started_at"] = utc_timestamp()
+    _write_job(root_dir, pool_id, job)
+    _send_retained_wake(
+        sdk=sdk,
+        root_dir=root_dir,
+        pool_id=pool_id,
+        job=job,
+        message=str(session.launch["message"]),
+        stage="turn_boundary_wake",
+    )
+    if job.get("status") == "running":
+        _complete_turn_boundary_wake(job)
+        job["boundary_wake_count"] = int(job.get("boundary_wake_count", 0)) + 1
+        _write_job(root_dir, pool_id, job)
+    else:
+        intent["state"] = "outcome_unknown"
+        _write_job(root_dir, pool_id, job)
+
+
+def _send_retained_wake(
+    *,
+    sdk: AgentPosixSdkClient,
+    root_dir: Path | str,
+    pool_id: str,
+    job: dict[str, Any],
+    message: str,
+    stage: str,
+) -> None:
+    dispatch_nonce = str(uuid.uuid4())
+    message_with_nonce = f"{message}\n\ndispatch_nonce={dispatch_nonce}"
+    job["dispatch_nonce"] = dispatch_nonce
+    dispatch_record = {
+        "dispatch_nonce": dispatch_nonce,
+        "stage": stage,
+        "state": "platform_mutation_started",
+        "created_at": utc_timestamp(),
+    }
+    job.setdefault("dispatch_records", []).append(dispatch_record)
+    job["wake_intent"] = {
+        "state": "platform_mutation_started",
+        "dispatch_nonce": dispatch_nonce,
+        "message_sha256": hashlib.sha256(message_with_nonce.encode()).hexdigest(),
+        "stage": stage,
+        "created_at": utc_timestamp(),
+    }
+    _write_job(root_dir, pool_id, job)
+    try:
+        sent = sdk.invoke(
+            "message.send",
+            {
+                "recipientThinkthreadId": job["thinkthread_id"],
+                "text": message_with_nonce,
+                "wake": True,
+            },
+        )
+    except AgentPosixBridgeError as exc:
+        job["wake_intent"]["state"] = (
+            "outcome_unknown" if exc.completion_unknown else "failed"
+        )
+        job["wake_intent"]["error"] = str(exc)
+        dispatch_record["state"] = job["wake_intent"]["state"]
+        dispatch_record["error"] = str(exc)
+        job["status"] = "needs_recovery" if exc.completion_unknown else "failed"
+        job["error"] = {
+            "stage": stage,
+            "message": str(exc),
+            "error_code": exc.code,
+            "completion_unknown": exc.completion_unknown,
+        }
+        _write_job(root_dir, pool_id, job)
+        return
+    job["active_message_id"] = sent.get("messageId")
+    job["wake_intent"]["state"] = "sent"
+    job["wake_intent"]["message_id"] = sent.get("messageId")
+    job["wake_intent"]["sent_at"] = utc_timestamp()
+    dispatch_record["state"] = "sent"
+    dispatch_record["message_id"] = sent.get("messageId")
+    dispatch_record["sent_at"] = job["wake_intent"]["sent_at"]
+    job["status"] = "running"
+    job["started_at"] = job.get("started_at") or utc_timestamp()
+    _write_job(root_dir, pool_id, job)
