@@ -4007,6 +4007,174 @@ class FileSearchRuntime:
             self._write_candidate_record(run_id, record)
         return request_id, snapshot_id
 
+    def recover_pi_thinkthread_snapshot_requests(
+        self,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Reconcile durable snapshot captures after a Goal Plus process crash."""
+
+        run = self._load_run(run_id)
+        frozen = self._load_frozen_spec(run.frozen_spec_id)
+        if frozen.spec.strategy.worker_host != "pi-thinkthread":
+            raise ValueError(
+                "snapshot request recovery is only available for pi-thinkthread"
+            )
+        client = self._agent_posix_client()
+        client.preflight()
+        resolved: list[dict[str, str]] = []
+        failed: list[dict[str, str]] = []
+
+        for persisted in list(run.fs_requests):
+            if persisted.operation not in {"root_snapshot", "branch_snapshot"}:
+                continue
+            request_id = persisted.request_id
+            method = (
+                "fs.snapshot.create"
+                if persisted.operation == "root_snapshot"
+                else "fs.branch.snapshot"
+            )
+            branch_id = persisted.context.get("branch_id")
+            params: dict[str, Any] = {"requestId": request_id}
+            if persisted.operation == "branch_snapshot":
+                if not isinstance(branch_id, str):
+                    failed.append(
+                        {
+                            "request_id": request_id,
+                            "error": "branch snapshot request omitted branch_id",
+                        }
+                    )
+                    continue
+                params["branchId"] = branch_id
+
+            result = (
+                persisted.result
+                if persisted.state in {"succeeded", "closed"}
+                and isinstance(persisted.result, dict)
+                else None
+            )
+            try:
+                if result is None:
+                    result = self._invoke_durable_fs_operation(
+                        client=client,
+                        run_id=run_id,
+                        request_id=request_id,
+                        method=method,
+                        params=params,
+                        timeout_seconds=120,
+                    )
+                snapshot_id = result.get("snapshotId")
+                if not isinstance(snapshot_id, str) or not snapshot_id.startswith(
+                    "fsnap-"
+                ):
+                    raise RuntimeError(f"{method} recovery omitted snapshotId")
+
+                if persisted.operation == "root_snapshot":
+                    with self._run_transaction(run_id):
+                        latest = self._load_run(run_id)
+                        intent = next(
+                            (
+                                item
+                                for item in latest.fs_snapshot_intents
+                                if item.request_id == request_id
+                            ),
+                            None,
+                        )
+                        if intent is None:
+                            raise RuntimeError(
+                                "root snapshot request has no durable creation intent"
+                            )
+                        intent.state = "created"
+                        intent.snapshot_id = snapshot_id
+                        intent.updated_at = utc_timestamp()
+                        if intent.purpose == "initial_baseline":
+                            latest.baseline_artifact_ref = FsSnapshotArtifactRef(
+                                snapshot_id=snapshot_id
+                            )
+                        self._write_run(latest)
+                else:
+                    candidate_id = persisted.context.get("candidate_id")
+                    if not isinstance(candidate_id, str):
+                        raise RuntimeError(
+                            "branch snapshot request omitted candidate_id"
+                        )
+                    with self._run_transaction(run_id):
+                        record = self._load_candidate_record(run_id, candidate_id)
+                        intent = next(
+                            (
+                                item
+                                for item in record.fs_snapshot_intents
+                                if item.request_id == request_id
+                            ),
+                            None,
+                        )
+                        if intent is None:
+                            raise RuntimeError(
+                                "branch snapshot request has no durable creation intent"
+                            )
+                        intent.state = "created"
+                        intent.snapshot_id = snapshot_id
+                        intent.updated_at = utc_timestamp()
+                        self._write_candidate_record(run_id, record)
+
+                if persisted.state != "closed":
+                    self._close_fs_requests_after_evidence(
+                        run_id, [request_id], client
+                    )
+                resolved.append(
+                    {"request_id": request_id, "snapshot_id": snapshot_id}
+                )
+            except (AgentPosixBridgeError, RuntimeError) as exc:
+                failed.append({"request_id": request_id, "error": str(exc)})
+
+        with self._run_transaction(run_id):
+            latest = self._load_run(run_id)
+            snapshot_request_ids = {
+                item.request_id
+                for item in latest.fs_requests
+                if item.operation in {"root_snapshot", "branch_snapshot"}
+            }
+            recovery_reason = str(
+                latest.budget_used.get("needs_recovery_reason") or ""
+            )
+            previous = latest.budget_used.get("fs_recovery_previous_state")
+            other_fs_recovery = any(
+                item.operation not in {"root_snapshot", "branch_snapshot"}
+                and item.state in {"accepted", "running", "needs_recovery"}
+                for item in latest.fs_requests
+            )
+            snapshot_recovery_owned = bool(
+                previous is not None
+                and any(request_id in recovery_reason for request_id in snapshot_request_ids)
+            )
+            if (
+                not failed
+                and latest.baseline_artifact_ref is not None
+                and snapshot_recovery_owned
+                and not other_fs_recovery
+                and not (
+                    latest.publication is not None
+                    and latest.publication.state == "outcome_unknown"
+                )
+                and not latest.budget_used.get("fs_cleanup_recovery_active")
+            ):
+                previous = latest.budget_used.pop(
+                    "fs_recovery_previous_state", None
+                )
+                latest.budget_used.pop("needs_recovery_reason", None)
+                if latest.state == RunState.NEEDS_RECOVERY:
+                    if isinstance(previous, str) and previous.startswith(
+                        "RunState."
+                    ):
+                        previous = previous.removeprefix("RunState.").lower()
+                    latest.state = (
+                        RunState(previous)
+                        if isinstance(previous, str)
+                        else RunState.RUNNING
+                    )
+            self._write_run(latest)
+            state = str(latest.state)
+        return {"state": state, "resolved": resolved, "failed": failed}
+
     def _settle_process_verifier(
         self,
         *,
