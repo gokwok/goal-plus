@@ -2483,3 +2483,264 @@ def test_verifier_rpc_replay_repairs_run_state_after_candidate_write_crash(
     original_candidate_write = runtime._write_candidate_record
     original_run_write = runtime._write_run
 
+    def observe_candidate_write(write_run_id, record):
+        nonlocal evidence_written
+        original_candidate_write(write_run_id, record)
+        if record.iterations and record.iterations[-1].rpc_request_id == "request-crash":
+            evidence_written = True
+
+    def crash_before_run_write(run):
+        nonlocal crashed
+        if evidence_written and not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash after candidate Evidence")
+        original_run_write(run)
+
+    monkeypatch.setattr(runtime, "_write_candidate_record", observe_candidate_write)
+    monkeypatch.setattr(runtime, "_write_run", crash_before_run_write)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        runtime.run_verifier(
+            run_id,
+            task.candidate_id,
+            agent_session_id=session.agent_session_id,
+            hypothesis="crash at settlement boundary",
+            idempotency_key="request-crash",
+        )
+    monkeypatch.setattr(runtime, "_write_candidate_record", original_candidate_write)
+    monkeypatch.setattr(runtime, "_write_run", original_run_write)
+    platform_runs = len(client.run_params)
+    annotator_kicks: list[str] = []
+    monkeypatch.setattr(runtime, "_kick_evidence_annotator", annotator_kicks.append)
+
+    report = runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="ignored on exact replay",
+        idempotency_key="request-crash",
+    )
+
+    assert len(client.run_params) == platform_runs
+    assert annotator_kicks == [run_id]
+    run = runtime._load_run(run_id)
+    assert run.candidates_evaluated == 1
+    record = runtime._load_candidate_record(run_id, task.candidate_id)
+    if len(scores) == 1:
+        assert report.disposition == "keep"
+        assert run.best_candidate_id == task.candidate_id
+        assert run.best_score == 1.5
+        assert json.loads(
+            (runtime._run_dir(run_id) / "best.json").read_text(encoding="utf-8")
+        )["artifact_ref"] == record.iterations[-1].attempt_ref.model_dump(mode="json")
+    else:
+        assert report.disposition == "discard"
+        restore = [
+            item
+            for item in run.fs_cleanup
+            if item.get("kind") == "branch_restore"
+            and item.get("attempt_snapshot_id")
+            == record.iterations[-1].attempt_ref.snapshot_id
+        ]
+        assert len(restore) == 1
+        runtime.complete_pi_thinkthread_restore(
+            run_id=run_id,
+            candidate_id=task.candidate_id,
+            branch_id=record.task.fs_branch_id,
+            target_snapshot_id=record.iterations[-1].settled_ref.snapshot_id,
+        )
+        job = _load_job(
+            runtime.root_dir,
+            opened["pool_id"],
+            opened["jobs"][0]["job_id"],
+        )
+        target_snapshot_id = record.iterations[-1].settled_ref.snapshot_id
+        client.branch_states[record.task.fs_branch_id]["baseSnapshotId"] = (
+            target_snapshot_id
+        )
+        job["restore_required"] = {
+            "state": "restoring",
+            "target_snapshot_id": target_snapshot_id,
+        }
+        assert _restore_job_branch(
+            runtime,
+            client,
+            runtime.root_dir,
+            opened["pool_id"],
+            job,
+        )
+        assert job["restore_required"]["state"] == "restored"
+        runtime.complete_pi_thinkthread_restore(
+            run_id=run_id,
+            candidate_id=task.candidate_id,
+            branch_id=record.task.fs_branch_id,
+            target_snapshot_id=record.iterations[-1].settled_ref.snapshot_id,
+        )
+
+
+@pytest.mark.pi
+def test_shared_tool_settlement_receipt_replays_before_iteration_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [1.5]
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    task = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=1).plan_id,
+    )[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    runtime.stage_shared_tool(
+        session.agent_session_id,
+        name="probe",
+        summary="Reusable deterministic probe",
+        entrypoint="probe.py:probe",
+        candidate_relative_source_paths=[".tmp/tool-drafts/probe.py"],
+        idempotency_key="request-stage-probe",
+    )
+    original_candidate_write = runtime._write_candidate_record
+    crashed = False
+
+    def crash_before_iteration_evidence(write_run_id, record):
+        nonlocal crashed
+        if (
+            record.iterations
+            and record.iterations[-1].rpc_request_id == "request-share-crash"
+            and not crashed
+        ):
+            crashed = True
+            raise RuntimeError("simulated crash before iteration Evidence")
+        original_candidate_write(write_run_id, record)
+
+    monkeypatch.setattr(
+        runtime,
+        "_write_candidate_record",
+        crash_before_iteration_evidence,
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        runtime.run_verifier(
+            run_id,
+            task.candidate_id,
+            agent_session_id=session.agent_session_id,
+            hypothesis="publish shared probe",
+            toolization_decision={
+                "outcome": "staged",
+                "signals": ["domain_probe"],
+                "rationale": "The other candidate can reuse this probe.",
+                "tool_names": ["probe"],
+            },
+            idempotency_key="request-share-crash",
+        )
+    monkeypatch.setattr(runtime, "_write_candidate_record", original_candidate_write)
+    index = json.loads(
+        (runtime._run_dir(run_id) / "shared" / "index.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "request-share-crash" in index["settlements"]
+
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="ignored on replay",
+        idempotency_key="request-share-crash",
+    )
+
+    iteration = runtime._load_candidate_record(run_id, task.candidate_id).iterations[-1]
+    assert len(iteration.shared_tools) == 1
+    assert iteration.shared_tools[0].tool_id == index["tools"][0]["tool_id"]
+    assert iteration.shared_tool_publish_status == "published"
+
+
+@pytest.mark.pi
+def test_request_close_failure_is_retried_after_next_durable_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = make_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = FileSearchRuntime(project / ".gp-test")
+    client = StatefulPoolAgentPosixClient(project)
+    client.run_scores = [1.0, 2.0]
+    monkeypatch.setattr(runtime, "_agent_posix_client", lambda: client)
+    frozen = runtime.freeze_spec(thinkthread_spec(project), [project / "evaluator.py"])
+    run_id = runtime.create_run(frozen.frozen_spec_id)
+    task = runtime.start_batch(
+        run_id,
+        runtime.plan_next(run_id, requested_k=1).plan_id,
+    )[0]
+    session = runtime.start_agent_session(run_id, task.candidate_id)
+    open_pool(
+        root_dir=runtime.root_dir,
+        run_id=run_id,
+        candidate_ids=[task.candidate_id],
+        client=client,
+    )
+    original_invoke = client.invoke
+    failed_request_id: str | None = None
+    close_calls: list[str] = []
+
+    def fail_first_close(operation: str, params=None, **kwargs):
+        nonlocal failed_request_id
+        if operation == "fs.request.close":
+            close_calls.append(str(params["requestId"]))
+            if failed_request_id is None:
+                failed_request_id = str(params["requestId"])
+                raise AgentPosixBridgeError(
+                    "simulated close response loss",
+                    error={"delivery": "completion_unknown"},
+                )
+        return original_invoke(operation, params, **kwargs)
+
+    monkeypatch.setattr(client, "invoke", fail_first_close)
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="first verifier leaves a close recovery record",
+        idempotency_key="request-close-first",
+    )
+    assert failed_request_id is not None
+    pending = [
+        item
+        for item in runtime._load_run(run_id).fs_cleanup
+        if item.get("kind") == "request_close"
+        and item.get("request_id") == failed_request_id
+    ]
+    assert pending[-1]["state"] == "needs_recovery"
+
+    runtime.run_verifier(
+        run_id,
+        task.candidate_id,
+        agent_session_id=session.agent_session_id,
+        hypothesis="second verifier retries the prior close",
+        idempotency_key="request-close-second",
+    )
+
+    run = runtime._load_run(run_id)
+    recovered = [
+        item
+        for item in run.fs_cleanup
+        if item.get("kind") == "request_close"
+        and item.get("request_id") == failed_request_id
+    ]
+    assert recovered[-1]["state"] == "closed"
+    assert next(
+        item for item in run.fs_requests if item.request_id == failed_request_id
+    ).state == "closed"
+    assert close_calls.count(failed_request_id) == 2
+
+
+@pytest.mark.pi
