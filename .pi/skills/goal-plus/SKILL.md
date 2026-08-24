@@ -69,7 +69,8 @@ PASS/FAIL、数值排名、candidate-local 结算、selection 或 promotion。Ma
 不负责定义这些维度，也不要根据 benchmark 类型向 annotator 预埋固定清单。
 
 如果原始命令包含 `workers=...` 或兼容别名 `models=...`，先调用
-`goal_plus_list_models(host="pi-rpc")`，将用户
+`goal_plus_list_models`：ThinkThread Profile 使用 `host="pi-thinkthread"`，普通 Pi 使用
+`host="pi-rpc"`。将用户
 填写的名称解析为唯一可用模型并冻结到 `strategy.models`；不存在或不唯一时，在创建
 run 前直接返回错误。`workers=A,B max_parallel=4` 表示 A、B、A、B；
 `workers=A,B A1B3 max_parallel=4`（等价写法 `workers=A*1,B*3`）表示显式
@@ -105,13 +106,17 @@ A1B3，数量之和必须等于
 `origin="initial"` 和 `origin="in_progress"` 仅表示 provenance，遵循相同的自主准入规则。
 
 调用 `search_freeze_spec` 前，确保 SearchSpec strategy 设置
-`worker_host: "pi-rpc"` 和 `orchestration_mode: "parallel_loops"`。Pi Search Mode
-必须通过 Pi RPC driver 运行一组固定的初始自主候选循环。不能省略这些字段；旧运行时默认值
-不能表达该 policy。
+`orchestration_mode: "parallel_loops"`，并依据启动上下文选择唯一 host：
 
-新 SearchSpec 还必须显式设置 `workspace.backend="git_worktree"`，使候选共享 Git object
-database，并能解析 Global Evidence 中的 peer commit。只有用户明确要求兼容隔离时才能设置
-`workspace.backend="copy"`。
+- 通过 `tt pi-goal-plus` 启动的 ThinkThread Root Profile 使用
+  `worker_host: "pi-thinkthread"`，且 SearchSpec 必须完全省略 `workspace`。Candidate 使用
+  ThinkThread private COW branch、exact FsSnapshot verifier 和 retained Child Session；不得
+  启动 Git worktree、`goal-plus-pi-worker` 或 `pi --mode rpc` Candidate 链路。
+- 普通 Pi 使用 `worker_host: "pi-rpc"`，并显式设置
+  `workspace.backend="git_worktree"`；只有用户明确要求兼容隔离时才能设置 `copy`。
+
+不能省略 host 字段或把 ThinkThread 当作 `workspace.backend`；扩展注入的当前 Profile 合同
+是权威依据。
 
 Pi 支持的 strategy name 仅限以下可移植内置子集：
 
@@ -151,7 +156,11 @@ subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁�
    可复用现有 `frozen_spec_id`
 2. `search_create`。首个 run 必须省略 `source_run_id`；如果 strict tool schema 要求
    该属性则传 `null`。只有创建真实后继 run 时才传入已存在的准确 `run_*` ID，绝不能
-   传入 `initial` 或 `in_progress`
+   传入 `initial` 或 `in_progress`。ThinkThread Root/branch snapshot capture 会在平台调用前
+   持久化 caller-owned RequestId。若主进程在 capture admission 后中断，先通过
+   `goal_plus_monitor_snapshot` 找回准确 run，再调用
+   `search_recover_pi_thinkthread(run_id)`；它只查询或使用同一 RequestId 幂等重放并绑定
+   exact FsSnapshotId。绝不能重新调用 `search_create` 或生成新 RequestId 盲重试
 3. `goal_plus_link_search_run`
 4. 调用且只调用一次 `search_plan_next(requested_k=budget.max_parallel)`，再调用且只调用
    一次 `search_start_batch`，创建全部初始候选。运行时会拒绝 `parallel_loops` 模式下的
@@ -166,7 +175,8 @@ subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁�
    继续调用 `pi_search_pool_wait_any`，不能调用 `pi_search_pool_close`、选择或提升。
    `candidate_ready` 表示 driver 已启动并绑定 agent session，最低累计 lease 已释放，且当前产物
    有 durable process Evidence；仅有一次原始进程退出不代表成功。原生 turn 在最低时间或最低
-   verifier 次数前结束时，supervisor 会占用同一个 slot，自动恢复同一个 session 和 worktree。
+   verifier 次数前结束时，supervisor 会占用同一个 slot。普通 Pi 自动恢复同一个 session
+   和 worktree；ThinkThread 自动 wake 同一个 retained Session 和 private branch。
    如果 worker assistant 因 `stopReason="length"` 结束，且该响应没有 tool call，worker-local
    扩展不会续跑旧上下文；driver 会返回 refresh 信号，pool supervisor 随即在同一 candidate/workspace
    上创建新的 `agent_session_id`。main agent 不参与判断或恢复，已有工作区改动和 durable Evidence 保留。
@@ -176,7 +186,7 @@ subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁�
 7. 对每个 `candidate_ready`，从 `search_list_history` 或
    `goal_plus_monitor_snapshot` 读取之前和当前的最佳结果。pool 的 `final_verify=true`
    路径会复用匹配当前产物的 durable Evidence；仅在没有匹配 Evidence 时补一次父级 process
-   verifier，因此持久化最佳候选/分数是最新的。检查
+   verifier，也就是缺失时补父级 `search_run_verifier`，因此持久化最佳候选/分数是最新的。检查
    `handle.metadata.progress_handoff.model_handoff` 和 `verifier_assessment` 以便恢复或
    识别具体 verifier 失败，但不要用它们选择下一技术方向。诊断稀疏、分数低或没有改进，
    都不是重新冻结、停止或替换候选的理由。如果主 agent 确认 verifier 契约、覆盖范围、
@@ -200,20 +210,21 @@ subagent 负责其候选工作区内的瓶颈分析、假设选择、特性迁�
    验证每项实质变更，并在仍有分配预算时继续工作。
    ```
 
-   Pi continuation 是跨进程原生 session continuation：supervisor 在同一工作区启动新的
-   Pi 进程，但会调用 `search_continue_agent_session` 并重新加载同一个持久化 Pi session。
-   它保留 `agent_session_id` 和候选身份。初始 pool 创建后，不要调用
+   普通 Pi continuation 会在同一 worktree 恢复持久化 Pi session；ThinkThread continuation
+   则向同一个 retained Child Session 发送 wake Message，并保持同一个 private branch。
+   两者都在同一工作区语义下保留 `agent_session_id` 和候选身份。初始 pool 创建后，不要调用
    `search_plan_next`、`search_start_batch` 或任何新候选提交。不要根据排名或改进情况
    改变 continuation。
+   普通 Pi 的实现是跨进程原生 session continuation；ThinkThread 则是 retained Child Session continuation。
    主 Pi 轮次中断后，使用 `pi_search_pool_snapshot(run_id=...)` 重新发现 pool；
    后续准确 snapshot 使用 `pool_id`。
 9. 正常选择前等待准确 snapshot 的 `active_count=0`，再调用
    `pi_search_pool_close(mode="drain")`。只有 run 已按第 7 步失效时，主 agent 才对仍有
    active job 的 pool 使用 `mode="interrupt"`。运行时会拒绝在真实 closeout reserve 之外
    提前关闭 active pool。pool 关闭后再按提升要求调用 `search_select` 和 `search_promote`。
-   `search_select` 对 verifier 记录的 iteration 排名并 checkout 最佳已提交候选的
-   `git_head`。准确 worker Evidence 已经覆盖该产物时直接用于选择；没有这种证据的旧记录才
-   使用父级 process verifier。配置的 promotion verifier 仍是选中 revision 的最终 gate。
+   `search_select` 对 verifier 记录的 iteration 排名并绑定准确 passing ArtifactRef。普通 Pi
+   使用 `git_commit`；ThinkThread 使用 exact `fs_snapshot`，不 checkout 或伪造 Git commit。
+   配置的 promotion verifier 仍在选中 artifact 上执行最终 gate。
 10. 调用 `goal_plus_record_search_result`。此时不要调用 `search_report`；结果记录只预留
     规范报告路径，不生成 Markdown 或 HTML。
 11. 执行原始目标审计。评估/编辑契约仍充分时保留同一个 run。新 incumbent 或低性能路线
@@ -279,9 +290,12 @@ triage 和新检查，而旧 Search 任务仅保留为审计历史。
 
 `pi_search_pool_*` 工具是 host 拥有的 supervisor，不是 Search 运行时 lifecycle API。
 其持久化状态位于 `.gp/host-pools/pi/`。它们强制执行 `max_parallel`，返回 `wait_any`
-事件，并能在主 Pi 轮次断开后继续存在。每个 pool job 内部执行相同链条：
-`search_start_agent_session`、前台 Pi RPC worker 启动、`search_bind_agent_handle`，
-以及 `final_verify=true` 时复用当前 durable Evidence 或在缺失时补父级 `search_run_verifier`。
+事件，并能在主 Pi 轮次断开后从持久化状态恢复。普通 Pi pool job 启动前台 Pi RPC worker；
+ThinkThread pool job 从同一 baseline spawn private Child，绑定 sender/session/branch，通过 Message
+结算 worker tool，并在 turn boundary 执行 restore/shared-tool apply。两条路径都在内部完成
+`search_start_agent_session`、host handle 绑定和准确 Evidence 结算。
+普通 Pi 的 `final_verify=true` 路径复用当前 durable Evidence，仅在当前产物没有匹配记录时
+补一次父级 verifier；ThinkThread 的 worker verifier 已直接绑定 exact snapshot。
 这些机械步骤不是公开的 Pi 主 agent 工具。
 
 不要从 Pi 主 agent 调用 `search_start_agent_session`、`search_bind_agent_handle` 或
@@ -289,19 +303,21 @@ triage 和新检查，而旧 Search 任务仅保留为审计历史。
 调用 `pi_search_pool_continue`。supervisor 随后在内部使用
 `search_continue_agent_session`，记录该步骤，再针对同一个原生 session 启动下一进程。
 
-初始 pool 启动和 continuation 都是非阻塞的；detached wrapper 负责前台 Pi RPC 子进程及其
-清理。`worker_budget.max_runtime_seconds` 是必需字段，并映射到 Pi RPC 进程 watchdog。
-`min_runtime_seconds`/`min_verifier_runs` 由 wrapper 按一个 pool job 的累计时间和 worker
-verifier 计数执行；提前结束会自动缩减剩余 max budget 并恢复同一原生 session。基础设施失败、
+初始 pool 启动和 continuation 都是非阻塞的。普通 Pi 使用 detached wrapper 管理前台 Pi RPC；
+ThinkThread 由同一个 `goal_plus.pi_pool` facade 内的 Root controller 管理 Child、Message、
+private branch 和 retained wake，不启动额外 daemon 或 Candidate RPC 进程。
+`worker_budget.max_runtime_seconds` 是必需字段并由对应 host controller 强制执行。
+`min_runtime_seconds`/`min_verifier_runs` 按一个 pool job 的累计时间和 worker verifier 计数执行；
+提前结束会在剩余 max budget 内恢复同一原生 session。基础设施失败、
 pool close 或外层 closeout 会停止自动恢复。最低 lease 到硬上限仍未满足的 job 终态为
 `timed_out`，不会发布 `candidate_ready`。`worker_budget.max_turns` 只是 prompt 提示。没有公开
 的同步候选/batch runner 或手动 pool 提交 API。
 
-Pi worker 把原生 session JSONL 持久化到 `.gp/host-sessions/pi/`。只有 pool 返回
-`candidate_ready` 且全局停止 policy 为 false 时，才调用 `pi_search_pool_continue`。driver
-启动另一 Pi 进程，重新加载同一个原生 session，保留 `agent_session_id`，并且只请求上次
-持久化 metrics cursor 之后的 entry。如果原生 session 加载失败，MCP history、verifier
-iteration、Git 状态和有界 handoff 仍是权威恢复证据。
+只有 pool 返回 `candidate_ready` 且全局停止 policy 为 false 时，才调用
+`pi_search_pool_continue`。普通 Pi 重新加载其持久化 session JSONL；ThinkThread wake 同一个
+native Child Session。若 host-native continuation 失败，Goal Plus iteration、ArtifactRef、
+verifier Evidence 和有界 handoff 仍是权威恢复证据，不能把失败的 execution 当作丢失的
+passing snapshot。
 
 每次 continuation launch 都开始新的派发级预算。原生会话中早期派发保存的 deadline、
 closeout 或时间提示都只是历史；只遵守最新 launch 之后收到的警告。
@@ -313,7 +329,7 @@ closeout 或时间提示都只是历史；只遵守最新 launch 之后收到的
 由 host driver 而不是 MCP 运行时负责结束 pool 中仍在执行的其他 worker。
 
 每个 worker 也会在其绑定 handle 中留下有界 `progress_handoff`。它将可选的
-`.tmp/handoff.json` 恢复记录与 runner 拥有的 Git 和 verifier snapshot 合并。
+`.tmp/handoff.json` 恢复记录与 runtime 拥有的 artifact 和 verifier snapshot 合并。
 `search_get_agent_context` 在 `context.resume` 下暴露它；使用该显式 resume 对象获取产物
 和 verifier 事实。原生 Pi 会话可以保留推理和 continuation 指令，但绝不能覆盖持久证据
 或 top-N history。
@@ -323,15 +339,17 @@ closeout 或时间提示都只是历史；只遵守最新 launch 之后收到的
 它不会改变冻结 spec。
 
 不要仅因 worker handle 含有 `timed_out=true` 就重新派发。如果候选已经有
-`process_passed=true` 且有 Git 支持的 iteration，该最佳 iteration 仍是有效 Search 证据，
+`process_passed=true` 且有准确 ArtifactRef 支持的 iteration，该最佳 iteration仍是有效
+Search 证据，
 并符合后续规划和选择条件。正式 history 在 `score` 和 `best_iteration` 中报告该最佳证据，
 而 `latest_score` 和 `latest_process_passed` 保留后续 timeout 或 regression 供诊断。
 
 candidate-local history 由运行时拥有，不是本地 plan 文件。worker 必须先调用
 `search_get_agent_context`，并使用 `context.resume`、`context.iterations`、
-`context.results` 和继承的 `context.results_tsv` 作为恢复来源。每轮修改前读取
+`context.results` 作为跨 host 恢复来源；普通 Pi 还可看到兼容的
+`context.results_tsv`。每轮修改前读取
 `search_get_global_evidence`。其他 candidate 的尝试只通过这个窄视图披露；`view=null`
-只表示 annotator 尚未更新，worker 不等待或轮询，先依据 commit、score、disposition 和
+只表示 annotator 尚未更新，worker 不等待或轮询，先依据 ArtifactRef、score、disposition 和
 自己的推理独立探索。`context.supplemental_evaluation_enabled=false` 时不要
 等待或尝试读取补充评价；启用时仅以 `supplemental_available` 标记可展开的行。仅在线路
 停滞、结构性分数跃升、hidden 泛化风险或官方/本地结果
@@ -339,21 +357,21 @@ candidate-local history 由运行时拥有，不是本地 plan 文件。worker �
 完整内容包含 annotator 根据实际 Evidence 后验提出的观察维度，以及 annotation task 创建时
 对其他已结算候选的动态比较。它不来自
 FrozenSpec，不作为硬分、推荐或 promotion gate；worker 可据此形成假设，但应独立核对。仅在
-worker 独立判断确有必要时，才在当前 workspace 使用
-`git diff HEAD <commit> -- <allowed-file>` 做只读比较，不访问其他 candidate workspace，
-也不 checkout/reset peer commit。worker verifier 用一句话 `hypothesis` 客观概括本轮实际
-尝试。运行时校验工作区根目录
-`results.tsv`，为每份返回报告追加且只追加一条记录，并提交账本。worker 绝不直接编辑它。
+worker 独立判断确有必要时，普通 Pi 才可在当前 workspace 使用
+`git diff HEAD <commit> -- <allowed-file>` 做只读比较；ThinkThread 只消费 runtime 物化的
+snapshot diff/文件上下文，不调用 Git 或访问 sibling branch。worker verifier 用一句话
+`hypothesis` 客观概括本轮实际尝试。兼容 `results.tsv` 仅属于 Git host；ThinkThread 的
+Result ledger 直接持久化 exact FsSnapshot ArtifactRef。worker 都不能直接编辑运行时账本。
 process verifier 同时返回 candidate-local `disposition`：严格改善为 `keep`，同分为
 `retain` 并成为最新工作基线，退化为 `discard`，无有效排名证据为 `failure`。runtime
-保留实际被测 commit，并只在 `discard`/`failure` 后恢复 candidate best；worker 不得
+保留实际被测 artifact，并只在 `discard`/`failure` 后恢复 candidate best；worker 不得
 自行 reset verifier-backed 状态。开放式补充评价不改变结算、硬 score 或最终 PASS/FAIL。
 如果 worker 提供 handoff，后续 iteration history 会包含最新结构化 `research_summary`；
 应使用其中任务特定的结果和问题，避免重复失败变体。
 
 需要候选工具共享时，冻结 spec 必须显式设置 `shared_dir.enabled=true`；
 默认关闭。候选侧的发布、Tool View、复制与采用规则由
-`.pi/prompts/search-candidate-worker.md` 执行。worker 将显式 source drafts 放在
+当前 host 的 `search-candidate-worker` prompt 执行。worker 将显式 source drafts 放在
 `.tmp/tool-drafts/`，可用 `search_stage_shared_tool` 安全生成 staging，并在每次归属明确的
 process verifier 中提交 `toolization_decision`。决策与 advisory 只进入 iteration、monitor 和
 report；实际 staging inventory 与 passing verifier settlement 始终是发布权威，决策本身不进入
@@ -362,10 +380,10 @@ Global Evidence，也不改变 hard score、结算、选择或 promotion。
 对优化任务，要求 worker 在长时间本地优化循环前创建完整候选产物，并尽早运行
 `search_run_verifier`。对 fix/target 任务，要求先编辑允许文件再调用 verifier；
 不要把未修改初始状态的验证计为 worker 证据。`search_run_verifier` 会在运行 verifier 前
-自动提交候选工作区中已修改的候选产物文件，因此 Search 进展必须体现为带真实
-`git_head` 的 verifier 记录运行时 iteration，不能隐藏在 worker transcript 或临时脚本中。
+捕获准确候选 artifact，因此 Search 进展必须体现为带真实 `git_commit` 或 `fs_snapshot`
+ArtifactRef 的 verifier iteration，即由 verifier 记录运行时 iteration，不能隐藏在 worker transcript 或临时脚本中。
 
-Pi RPC worker 还会在完成 worker 工具后检查提示性时间估算。存在 verifier 证据后，runner
+普通 Pi RPC worker 还会在完成 worker 工具后检查提示性时间估算。存在 verifier 证据后，runner
 把可用 worker 或外层任务时间，与“最后一次 subagent verifier - 首个候选 session”的时间
 除以 subagent verifier 次数所得平均值进行比较，并在采样候选间汇总。如果剩余时间已无法
 容纳一次平均提交，它只向该 Search 候选发送一次提示性 `steer`。这不会停止 worker，
@@ -392,9 +410,9 @@ Pi 将 `goal-plus` 暴露为完整的面向用户 skill。不要把 Search Mode 
 它是主要只读监控路径。
 
 monitor 汇总持久化 `.gp` 证据，包括目标状态、全部已链接 Search 任务、每项任务的规划/已启动
-轮次数、聚合任务、候选、worker session、verifier 和 Pi 成本计数、所选候选、所选 commit、
-报告与提升路径、候选分数、每个 iteration git head、agent session、verifier iteration、
-一次性时间提示证据、Pi RPC token/cost/context 指标以及 stale/timed-out 警告。
+轮次数、聚合任务、候选、worker session、verifier 和 Pi 成本计数、所选候选、所选
+ArtifactRef、报告与提升路径、候选分数、每个 iteration artifact、agent session、verifier
+iteration、一次性时间提示证据、可用的 Pi host 指标以及 stale/timed-out 警告。
 它不会启动、等待或停止 worker。
 
 对一个 worker 使用 `search_get_agent_observability(agent_session_id)`。它跨 host 返回相同的

@@ -290,11 +290,13 @@ def test_pi_extension_registers_role_tools_gate_and_workspace_guard() -> None:
     assert "GOAL_PLUS_PI_ROLE" in text
     assert 'role === "main"' in text
     assert 'role === "worker"' in text
+    assert 'const isThinkThreadWorker = role === "worker" && isThinkThreadProfile' in text
     assert "goal_plus_create" in text
+    assert 'Type.Literal("pi-thinkthread")' in text
     assert "search_get_agent_context" in text
     assert "search_run_verifier" in text
-    assert "workspace/results.tsv" in text
-    assert "且只追加一条已验证记录" in text
+    assert "workspace/results.tsv" not in text
+    assert "pi-thinkthread 不创建 commit 或 results.tsv" in text
     assert "VerifierWorkspaceSideEffect" in text
     assert "GOAL_PLUS_VERIFIER_TMPDIR" in text
     assert "pi_rpc_run_worker" not in text
@@ -302,6 +304,8 @@ def test_pi_extension_registers_role_tools_gate_and_workspace_guard() -> None:
     assert "pi_search_run_candidate" not in text
     assert 'pi.registerCommand("goal-plus"' in text
     assert 'pi.registerCommand("goal-plus-with-final-check"' in text
+    assert 'if (role === "main" && !isPrintLikeInvocation)' in text
+    assert 'role === "main" && typeof pi.registerEntryRenderer' in text
     assert "mode=autonomous|probe" in text
     assert "parseGoalPlusRoleModels" in text
     assert "applyGoalPlusRoleModels" in text
@@ -313,6 +317,10 @@ def test_pi_extension_registers_role_tools_gate_and_workspace_guard() -> None:
     assert "goal-plus-native-state" in text
     assert 'pi.on("session_start"' in text
     assert 'pi.on("before_agent_start"' in text
+    assert "if (isThinkThreadWorker) registerWorkerMessageTool" in text
+    assert "else registerRuntimeTool" in text
+    assert "if (isThinkThreadProfile) await validateThinkThreadRole(ctx)" in text
+    assert "if (isThinkThreadWorker)" in text
     assert 'pi.on("agent_end"' in text
     assert 'lastMessage?.role === "assistant"' in text
     assert 'lastMessage.stopReason === "error"' in text
@@ -342,7 +350,7 @@ def test_pi_extension_registers_role_tools_gate_and_workspace_guard() -> None:
     assert "goal_plus.pi_worker" in text
     assert "isPrintLikeInvocation" in text
     assert 'process.argv.includes("-p")' in text
-    assert "if (!isPrintLikeInvocation)" in text
+    assert 'if (role === "main" && !isPrintLikeInvocation)' in text
     assert 'mode !== "print"' in text
     assert "function canPersistGoalState" in text
     assert 'pi.on("input"' in text
@@ -413,6 +421,8 @@ def test_pi_extension_has_precise_tool_schemas_and_error_classification() -> Non
     assert "const RuntimeToolDescriptions" in text
     assert "RuntimeToolDescriptions[name]" in text
     assert "search_get_agent_context:" in text
+    assert "limit: 32" in text
+    assert "limit: 64" not in text
     assert "search_copy_shared_tool:" in text
     assert "search_stage_shared_tool:" in text
     assert "candidate_task.share_out_dir 非空表示已启用 shared_dir" in text
