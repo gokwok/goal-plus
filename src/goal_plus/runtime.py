@@ -3838,6 +3838,175 @@ class FileSearchRuntime:
                 settlement_id=settlement_id,
             )
 
+    def capture_pi_thinkthread_branch_snapshot(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        branch_id: str,
+        purpose: str,
+        client: AgentPosixSdkClient,
+        intent_id: str | None = None,
+    ) -> tuple[str, str]:
+        """Capture one Child branch behind a durable caller-owned RequestId.
+
+        The Goal Plus request record and creation intent are persisted before
+        invoking ThinkThread. A transport-ambiguous response is reconciled or
+        replayed with the same RequestId, so the platform cannot create an
+        unidentifiable duplicate snapshot.
+        """
+
+        resolved_intent_id = intent_id or f"snapshot_{uuid.uuid4().hex}"
+        with self._run_transaction(run_id):
+            run = self._load_run(run_id)
+            record = self._load_candidate_record(run_id, candidate_id)
+            intent = next(
+                (
+                    item
+                    for item in record.fs_snapshot_intents
+                    if item.intent_id == resolved_intent_id
+                ),
+                None,
+            )
+            if intent is None:
+                now = utc_timestamp()
+                request_id = new_request_id()
+                intent = FsSnapshotCreationIntent(
+                    intent_id=resolved_intent_id,
+                    operation="branch_snapshot",
+                    request_id=request_id,
+                    branch_id=branch_id,
+                    purpose=purpose,
+                    created_at=now,
+                    updated_at=now,
+                )
+                record.fs_snapshot_intents.append(intent)
+                run.fs_requests.append(
+                    FsRequestRecord(
+                        request_id=request_id,
+                        operation="branch_snapshot",
+                        context={
+                            "candidate_id": candidate_id,
+                            "branch_id": branch_id,
+                            "intent_id": resolved_intent_id,
+                            "purpose": purpose,
+                        },
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                if intent.branch_id != branch_id:
+                    raise RuntimeError(
+                        "branch snapshot intent changed branch during recovery"
+                    )
+                if intent.snapshot_id is not None and intent.state in {
+                    "created",
+                    "cleaned",
+                }:
+                    if intent.request_id is None:
+                        raise RuntimeError(
+                            "legacy branch snapshot intent omitted request_id"
+                        )
+                    return intent.request_id, intent.snapshot_id
+                if intent.request_id is None:
+                    if intent.state != "prepared":
+                        raise RuntimeError(
+                            "legacy branch snapshot mutation cannot be recovered "
+                            "without a RequestId"
+                        )
+                    intent.request_id = new_request_id()
+                request_id = intent.request_id
+                if not any(
+                    item.request_id == request_id for item in run.fs_requests
+                ):
+                    now = utc_timestamp()
+                    run.fs_requests.append(
+                        FsRequestRecord(
+                            request_id=request_id,
+                            operation="branch_snapshot",
+                            context={
+                                "candidate_id": candidate_id,
+                                "branch_id": branch_id,
+                                "intent_id": resolved_intent_id,
+                                "purpose": purpose,
+                            },
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            intent.state = "platform_mutation_started"
+            intent.updated_at = utc_timestamp()
+            self._write_candidate_record(run_id, record)
+            self._write_run(run)
+
+        try:
+            result = self._invoke_durable_fs_operation(
+                client=client,
+                run_id=run_id,
+                request_id=request_id,
+                method="fs.branch.snapshot",
+                params={"branchId": branch_id, "requestId": request_id},
+                timeout_seconds=60,
+            )
+        except AgentPosixBridgeError:
+            with self._run_transaction(run_id):
+                record = self._load_candidate_record(run_id, candidate_id)
+                intent = next(
+                    item
+                    for item in record.fs_snapshot_intents
+                    if item.intent_id == resolved_intent_id
+                )
+                intent.state = "failed"
+                intent.updated_at = utc_timestamp()
+                self._write_candidate_record(run_id, record)
+            raise
+        except RuntimeError:
+            with self._run_transaction(run_id):
+                record = self._load_candidate_record(run_id, candidate_id)
+                intent = next(
+                    item
+                    for item in record.fs_snapshot_intents
+                    if item.intent_id == resolved_intent_id
+                )
+                intent.state = "needs_recovery"
+                intent.updated_at = utc_timestamp()
+                self._write_candidate_record(run_id, record)
+            raise
+
+        snapshot_id = result.get("snapshotId")
+        if not isinstance(snapshot_id, str) or not snapshot_id.startswith("fsnap-"):
+            self._mark_fs_recovery(
+                run_id,
+                reason=(
+                    f"fs.branch.snapshot request {request_id} returned no snapshotId"
+                ),
+            )
+            with self._run_transaction(run_id):
+                record = self._load_candidate_record(run_id, candidate_id)
+                intent = next(
+                    item
+                    for item in record.fs_snapshot_intents
+                    if item.intent_id == resolved_intent_id
+                )
+                intent.state = "needs_recovery"
+                intent.updated_at = utc_timestamp()
+                self._write_candidate_record(run_id, record)
+            raise RuntimeError("fs.branch.snapshot omitted snapshotId")
+
+        with self._run_transaction(run_id):
+            record = self._load_candidate_record(run_id, candidate_id)
+            intent = next(
+                item
+                for item in record.fs_snapshot_intents
+                if item.intent_id == resolved_intent_id
+            )
+            intent.state = "created"
+            intent.snapshot_id = snapshot_id
+            intent.updated_at = utc_timestamp()
+            self._write_candidate_record(run_id, record)
+        return request_id, snapshot_id
+
     def _settle_process_verifier(
         self,
         *,
