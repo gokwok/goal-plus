@@ -32,11 +32,14 @@ self-contained Goal Plus/official Agent POSIX SDK assets, then launch it from
 the target workspace:
 
 ```bash
-./scripts/install_pi_goal_plus_thinkthread.sh \
-  --thinkthread-source "$HOME/code/work/thinkthread"
+./scripts/install_pi_goal_plus_thinkthread.sh
 cd /path/to/target-workspace
 tt pi-goal-plus
 ```
+
+The installer fetches the official `@thinkthread/agent-posix` SDK from the
+[`capsule_public`](https://gitcode.com/aideveloper/capsule_public.git) `v0.1.0`
+release by default. It does not require a ThinkThread source checkout.
 
 This Profile reuses normal Pi models/auth/settings without installing Goal Plus
 into ordinary Pi configuration. See [Pi](docs/pi.md#thinkthread-profile).

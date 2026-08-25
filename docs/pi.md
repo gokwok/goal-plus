@@ -15,17 +15,23 @@ pi -p "/goal-plus inspect this repository"
 
 `pi-thinkthread` is an additional Pi Search host. It does not replace the
 legacy `pi-rpc` path above and does not change Codex or Git behavior. Install
-the reusable Profile and its self-contained assets with either the current
-ThinkThread source checkout or a prebuilt official SDK package:
+the reusable Profile and its self-contained assets. The installer obtains the
+official Agent POSIX SDK from the public `capsule_public` `v0.1.0` release:
 
 ```bash
 ./scripts/install_pi_goal_plus_thinkthread.sh \
-  --thinkthread-source "$HOME/code/work/thinkthread" \
   --model openai-codex/gpt-5.6-terra
 
 cd /path/to/target-workspace
 tt pi-goal-plus
 ```
+
+The default source is
+[`https://gitcode.com/aideveloper/capsule_public.git`](https://gitcode.com/aideveloper/capsule_public.git).
+Use `--agent-posix-ref` to select another release tag, `--thinkthread-source`
+for a local SDK checkout during development, or `--agent-posix-package` for an
+offline prebuilt `.tgz`. The installer always validates the Control v2 contract
+fingerprint before replacing the existing installation.
 
 If the target keeps its Python environment inside the workspace, activate that
 `.venv` before launch and use plain `tt pi-goal-plus`; the direct Root and COW

@@ -91,13 +91,20 @@ def test_pi_worker_extension_pins_the_same_agent_posix_contract() -> None:
     assert matched.group(1) == AGENT_POSIX_CONTRACT_FINGERPRINT
 
 
-def test_installer_help_documents_source_and_prebuilt_sdk_paths() -> None:
+def test_installer_help_documents_release_and_offline_sdk_paths() -> None:
     completed = subprocess.run(
         ["bash", str(INSTALLER_PATH), "--help"],
         check=True,
         text=True,
         capture_output=True,
     )
+    assert "--agent-posix-repository URL" in completed.stdout
+    assert (
+        "https://gitcode.com/aideveloper/capsule_public.git"
+        in completed.stdout
+    )
+    assert "--agent-posix-ref REF" in completed.stdout
+    assert "v0.1.0" in completed.stdout
     assert "--thinkthread-source PATH" in completed.stdout
     assert "--agent-posix-package FILE" in completed.stdout
     assert "tt pi-goal-plus" in completed.stdout

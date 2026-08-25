@@ -7,7 +7,8 @@ Install Goal Plus for the reusable ThinkThread Pi Profile.
 
 Usage:
   scripts/install_pi_goal_plus_thinkthread.sh \
-    (--thinkthread-source PATH | --agent-posix-package FILE) \
+    [--agent-posix-repository URL] [--agent-posix-ref REF] \
+    [--thinkthread-source PATH | --agent-posix-package FILE] \
     [--model PROVIDER/MODEL ...] [--python PYTHON] [--tt TT]
 
 The installation is self-contained under ~/.local/share/goal-plus. The
@@ -17,8 +18,12 @@ After installation, launch it from any target workspace with:
   tt pi-goal-plus
 
 Options:
-  --thinkthread-source PATH   ThinkThread checkout containing sdk/agent-posix/ts
-  --agent-posix-package FILE  Prebuilt @thinkthread/agent-posix .tgz package
+  --agent-posix-repository URL
+                              SDK release repository
+                              (https://gitcode.com/aideveloper/capsule_public.git)
+  --agent-posix-ref REF       SDK release tag or branch (v0.1.0)
+  --thinkthread-source PATH   Local SDK checkout containing sdk/agent-posix/ts
+  --agent-posix-package FILE  Offline @thinkthread/agent-posix .tgz package
   --model PROVIDER/MODEL      Delegate one exact Child model; repeatable
   --python PYTHON             Python used to create the private venv (python3)
   --tt TT                     Current ThinkThread host CLI. Prefers /usr/bin/tt
@@ -40,6 +45,10 @@ python_bin="python3"
 tt_bin="${GOAL_PLUS_TT:-}"
 thinkthread_source=""
 sdk_package=""
+sdk_repository="${GOAL_PLUS_AGENT_POSIX_REPOSITORY:-https://gitcode.com/aideveloper/capsule_public.git}"
+sdk_ref="${GOAL_PLUS_AGENT_POSIX_REF:-v0.1.0}"
+sdk_repository_explicit=false
+sdk_ref_explicit=false
 requested_models=()
 
 while (($# > 0)); do
@@ -52,6 +61,18 @@ while (($# > 0)); do
         --agent-posix-package)
             (($# >= 2)) || die "$1 requires a file"
             sdk_package="$2"
+            shift 2
+            ;;
+        --agent-posix-repository)
+            (($# >= 2)) || die "$1 requires a URL"
+            sdk_repository="$2"
+            sdk_repository_explicit=true
+            shift 2
+            ;;
+        --agent-posix-ref)
+            (($# >= 2)) || die "$1 requires a tag or branch"
+            sdk_ref="$2"
+            sdk_ref_explicit=true
             shift 2
             ;;
         --model)
@@ -83,13 +104,18 @@ done
 if [[ -n "$thinkthread_source" && -n "$sdk_package" ]]; then
     die "choose either --thinkthread-source or --agent-posix-package"
 fi
-if [[ -z "$thinkthread_source" && -z "$sdk_package" ]]; then
-    die "the official Agent POSIX SDK source or package is required"
+if [[ -n "$thinkthread_source" || -n "$sdk_package" ]]; then
+    if [[ "$sdk_repository_explicit" == true || "$sdk_ref_explicit" == true ]]; then
+        die "repository options cannot be combined with a local SDK source or package"
+    fi
 fi
 
 command -v "$python_bin" >/dev/null 2>&1 || die "Python is unavailable: $python_bin"
 command -v node >/dev/null 2>&1 || die "Node.js 20+ is required"
 command -v npm >/dev/null 2>&1 || die "npm is required to install the official SDK package"
+if [[ -z "$thinkthread_source" && -z "$sdk_package" ]]; then
+    command -v git >/dev/null 2>&1 || die "git is required to fetch the official SDK release"
+fi
 node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
 ((node_major >= 20)) || die "Node.js 20+ is required; found $(node --version)"
 
@@ -148,10 +174,20 @@ install -m 0644 "$repository_root/src/goal_plus/assets/thinkthread-agent-posix-b
 install -m 0755 "$repository_root/scripts/goal-plus-pi-tool-installed" \
     "$payload_root/bin/goal-plus-pi-tool"
 
-if [[ -n "$thinkthread_source" ]]; then
-    sdk_source="$thinkthread_source/sdk/agent-posix/ts"
+if [[ -z "$sdk_package" ]]; then
+    if [[ -n "$thinkthread_source" ]]; then
+        sdk_source="$thinkthread_source/sdk/agent-posix/ts"
+    else
+        sdk_checkout="$transaction_root/thinkthread-sdk-release"
+        git -C "$transaction_root" init --quiet "$(basename -- "$sdk_checkout")"
+        git -C "$sdk_checkout" remote add origin "$sdk_repository"
+        git -C "$sdk_checkout" fetch --quiet --depth 1 origin "$sdk_ref"
+        git -C "$sdk_checkout" -c advice.detachedHead=false \
+            checkout --quiet --detach FETCH_HEAD
+        sdk_source="$sdk_checkout/sdk/agent-posix/ts"
+    fi
     [[ -f "$sdk_source/package.json" && -f "$sdk_source/package-lock.json" ]] || \
-        die "ThinkThread source does not contain sdk/agent-posix/ts: $thinkthread_source"
+        die "SDK source does not contain sdk/agent-posix/ts: $sdk_source"
     sdk_build="$transaction_root/agent-posix-sdk"
     package_output="$transaction_root/package"
     mkdir -p -- "$sdk_build" "$package_output"
